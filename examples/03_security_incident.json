@@ -1,0 +1,12 @@
+{
+  "_entry_point": "manual_ticket",
+  "_description": "Suspected account takeover \u2014 hard-escalation keyword 'breach' force-bumps priority to urgent, requires specialist (security topic), Tier-3 SME is on the call.",
+  "payload": {
+    "channel": "phone",
+    "customer_id": "c-7e2c8",
+    "account_tier": "enterprise",
+    "raw_message": "I just got notifications that my account was accessed from an IP in another country at 3am. I haven't traveled. I think my account has been breached \u2014 please lock it now and check what data was leaked.",
+    "subject": "Possible breach \u2014 account accessed unfamiliar IP",
+    "received_at_utc": "2026-06-04T03:48:00Z"
+  }
+}

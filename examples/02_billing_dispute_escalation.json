@@ -1,0 +1,12 @@
+{
+  "_entry_point": "manual_ticket",
+  "_description": "Enterprise customer disputing a billing line \u2014 triage routes to billing specialist, sentiment is negative, hard escalation keyword 'regulator' triggers urgent priority.",
+  "payload": {
+    "channel": "email",
+    "customer_id": "c-bigco-007",
+    "account_tier": "enterprise",
+    "raw_message": "Your June invoice charges us for 200 seats but we only ever had 142 active. This is the third time this has happened and our legal team is reviewing whether to escalate to the regulator. We need this corrected before EOW.",
+    "subject": "URGENT \u2014 billing error on June invoice, third occurrence",
+    "received_at_utc": "2026-06-04T09:10:00Z"
+  }
+}

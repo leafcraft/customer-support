@@ -1,0 +1,1237 @@
+# customer-support — Customer Support (reactive ticket triage)
+#
+# A TEAM that triages inbound tickets across many channels (Slack,
+# email, chat widget, phone, web form, Discord, Telegram, WhatsApp),
+# resolves the routine majority agent-side, and escalates the rest to
+# the right human tier with full context.
+#
+# Distinct from customer-success — support is REACTIVE (someone has a
+# problem now), customer-success is PROACTIVE (catch risk before
+# escalation).
+#
+# Rule 1: peer-to-peer. intake normalises AND classifies (intent +
+# priority) in one stage, fanning out to sentiment in parallel;
+# response grounds itself in the KB before drafting;
+# QA can kick back to response_agent with feedback (yields-driven).
+#
+# ═══════════════════════════════════════════════════════════════════
+# WHY LEAFMESH (the value the ROI calculator quantifies)
+# ═══════════════════════════════════════════════════════════════════
+# Support ROI: cost-out (resolve routine tickets without humans).
+#   pool 12% of revenue in SaaS, routine share 70%, customer-visible
+#   trust posture.
+#
+#   - Channel-native HITL — operators reply where they already work
+#   - Sentiment + intent fan-in parallel — same event, two readings
+#   - KB-grounded responses — answers cite the policy / docs / past ticket
+#   - QA layer between draft and customer — never auto-send below
+#     confidence threshold OR with PII concerns
+#   - Escalation tiers: Tier-1 / Tier-2 / Tier-3 SME / queue manager
+#   - Hash-chained WORM audit of every reply approved + sent
+#
+# YAML-FIRST: this file IS the support desk. Every business rule —
+# hard-escalation keywords, voice fail-closed routing, no-source
+# confidence caps, PII/policy probes, CRM taxonomy — lives in the
+# prompts below. Ticket / CSAT / SLA / call-record state lives in
+# YOUR support desk + telephony + CRM (Zendesk/Intercom, Twilio/
+# Aircall, Salesforce) reached via connector agents — not template
+# SQLite. The only Python is the WORM audit sink in agency/_shared and
+# the egress actuator agency/reply_dispatcher_agent.py — the role that
+# actually SENDS the approved reply (a deterministic fail-closed send
+# floor + an outbox record; both genuinely need hands).
+
+name: "customer-support"
+version: "1.0.0"
+architecture: "managed_mesh"
+environment: "development"
+debug: true
+log_level: "INFO"
+
+redis:
+  host: "${REDIS_HOST:localhost}"
+  port: ${REDIS_PORT:6379}
+  db: 0
+  password: "${REDIS_PASSWORD:}"
+  auto_storage: true
+  decode_responses: true
+  default_ttl: 86400
+  session_ttl: 604800
+
+# ═══════════════════════════════════════════════════════════════════
+# EVENT BROKERS — the async ingestion surface (parallel to the per-channel
+# entry points, which are synchronous API calls). At volume, point your
+# channel webhooks (Slack Events API, inbound-email parser, chat widget)
+# at a thin receiver that writes each message onto this stream; intake
+# listens and wakes per event. DEV: a Redis stream (same Redis, no extra
+# dependency). PROD: swap to Kafka/SQS (uncomment) + pip install
+# leafmesh[kafka] / [sqs].
+# ═══════════════════════════════════════════════════════════════════
+brokers:
+  support_events:
+    type: "redis_streams"
+    url: "${SUPPORT_EVENTS_REDIS_URL:redis://localhost:6379}"
+    db: 1
+  # PROD — channel webhooks → SQS:
+  # support_events:
+  #   type: "sqs"
+  #   region: "${AWS_REGION:us-east-1}"
+
+# YAML-FIRST: agency/ carries exactly ONE per-agent module —
+# reply_dispatcher_agent.py, the egress actuator (auto-binds via this
+# pattern: agent_type programmatic + matching <name>.py). Everything
+# else is pure YAML. The other Python is agency/_shared/audit_logger.py
+# (WORM sink), registered in main.py.
+auto_discover:
+  directory: "./agency"
+  pattern: "*_agent.py"
+  recursive: false
+
+# ═══════════════════════════════════════════════════════════════════
+# MANAGER
+# ═══════════════════════════════════════════════════════════════════
+manager:
+  enabled: true
+  model: "gpt-4o-mini"
+  domain: "generic"
+  can_intervene: true
+
+  prompt: |
+    This mesh resolves inbound customer support tickets across many
+    channels. A successful ticket lifecycle:
+      - intake normalises any channel payload into a canonical Ticket
+        AND classifies intent + priority (routine vs sensitive); it
+        also owns the voice channel — call transcripts route
+        human / callback / self-serve from the same role
+      - sentiment scores urgency / frustration in parallel
+      - response grounds an answer in policy / docs / past tickets
+        (KB retrieval) and drafts the reply in one stage
+      - QA fact-checks + tone-checks + PII-checks before customer sees
+      - low-confidence OR sensitive tickets escalate to Tier-2 / Tier-3
+      - approved replies post via the channel adapter the ticket arrived on
+      - audit logs every approved reply + escalation
+      - insights (CSAT/NPS + ticket clusters), SLA breach state and
+        cross-channel customer identity are read from the company's
+        support desk + CRM (Zendesk/Intercom, Salesforce/Segment)
+        through n8n connector agents — they are not computed locally
+
+    Escalate when:
+      - the same customer files 3+ tickets in 24h on the same issue
+      - sentiment score >= 0.8 (high frustration) regardless of priority
+      - any ticket mentions cancel / refund / legal / regulator / harm
+      - response_agent's KB retrieval confidence < 0.7 — don't guess
+      - response_agent fails QA twice in a row on the same ticket
+
+    Watch for:
+      - knowledge gaps (questions with no good KB hit) — flag for docs
+      - tier-2 backlog (more than 20 tickets pending) — escalate to manager
+      - agent escalation patterns by topic (signals product issue)
+      - support_insights_agent spike clusters — a spiking ticket
+        cluster signals a possible regression worth engineering triage
+
+  routing:
+    mode: "learning"
+    memory_size: 300
+    confidence_threshold: 0.7
+    fallback: "all"
+    decay_days: 30
+
+  knowledge:
+    serviceName: "mongo_main"
+    enabled: true
+    groupName: "support_runbook"
+
+  escalation:
+    targets:
+      - type: "human_agent"
+        agent: "queue_manager_human"
+      - type: "webhook"
+        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
+        method: "POST"
+        headers:
+          Content-Type: "application/json"
+        payload_template:
+          incident_id: "{{ticket_id}}"
+          severity: "{{severity}}"
+          message: "{{message}}"
+          session_id: "{{session_id}}"
+      - type: "channel"
+        provider: "slack"
+        channel_id: "${SLACK_SUPPORT_CHANNEL:}"
+        message_template: "[support] {{message}} — ticket {{ticket_id}} (session {{session_id}})"
+
+    auto_escalate:
+      max_retries: 2
+      max_errors_per_session: 3
+      timeout_threshold: 2
+
+  health_check_interval: 60
+  agent_timeout_threshold: 300
+  chain_completion_timeout: 600
+
+mesh:
+  call_timeout: 120
+
+# ═══════════════════════════════════════════════════════════════════
+# DATA STRUCTURES
+# ═══════════════════════════════════════════════════════════════════
+data_structures:
+  Ticket:
+    type: "object"
+    properties:
+      ticket_id: { type: "string" }
+      customer_id: { type: "string" }
+      channel: { type: "string" }           # slack | email | chat | phone | web | discord | telegram | whatsapp
+      channel_thread_id: { type: "string" } # for posting reply back to same thread
+      received_at_utc: { type: "string" }
+      raw_message: { type: "string" }
+      attachments: { type: "list" }
+      account_tier: { type: "string" }      # standard | named | enterprise
+      raw_payload: { type: "object" }
+    required: ["customer_id", "channel", "raw_message"]
+
+  Triage:
+    type: "object"
+    properties:
+      intent: { type: "string" }            # how_to | bug | billing | account | cancel | feature_request | other
+      priority: { type: "string" }          # low | normal | high | urgent
+      requires_specialist: { type: "boolean" }
+      specialist_topic: { type: "string" }
+      escalation_keywords: { type: "list" }
+    required: ["intent", "priority"]
+
+# ═══════════════════════════════════════════════════════════════════
+# ENTRY POINTS — Rule 1: every channel is its own entry
+# ═══════════════════════════════════════════════════════════════════
+entry_points:
+  - name: "slack_message"
+    target: "ticket_intake_agent"
+    description: "Slack DM or thread reply"
+
+  - name: "email_inbound"
+    target: "ticket_intake_agent"
+    description: "Email to support@company.com"
+
+  - name: "chat_widget"
+    target: "ticket_intake_agent"
+    description: "On-site chat widget message"
+
+  - name: "phone_transcribed"
+    target: "ticket_intake_agent"
+    description: "Voice call transcribed (Twilio, Vonage, etc.)"
+
+  - name: "web_form"
+    target: "ticket_intake_agent"
+    description: "Web contact form submission"
+
+  - name: "social_channel"
+    target: "ticket_intake_agent"
+    description: "Discord / Telegram / WhatsApp / Teams message"
+
+  - name: "manual_ticket"
+    target: "ticket_intake_agent"
+    description: "Operator-created ticket (no inbound channel)"
+
+  - name: "callback_followup"
+    target: "response_agent"
+    description: "Human-tier handoff complete — bot drafts follow-up"
+
+  - name: "kb_gap_signal"
+    target: "kb_gap_filler_agent"
+    description: "Ticket resolved that had no KB hit — draft the missing article"
+
+  - name: "post_resolution_csat"
+    target: "support_insights_agent"
+    description: "Forward one CSAT or NPS response to your support desk (csat_ingest mode, via n8n)"
+
+  - name: "csat_rollup"
+    target: "support_insights_agent"
+    description: "Read CSAT/NPS rollups + cluster trends from your support desk analytics (report mode) — used by escalation routing"
+
+  - name: "ticket_pattern_scan"
+    target: "support_insights_agent"
+    description: "Scan recent tickets in your support desk for trending + spiking clusters (report mode)"
+
+  - name: "repeat_question_burst"
+    target: "kb_gap_filler_agent"
+    description: "Same question asked 3+ times in 24h — KB article missing or buried"
+
+  - name: "failed_search_log"
+    target: "kb_gap_filler_agent"
+    description: "KB search returned no results 5+ times — coverage gap signal"
+
+# ═══════════════════════════════════════════════════════════════════
+# AGENTS
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Direct-call entry points (every non-human, non-terminal
+#    agent is API-addressable; bypasses the upstream chain).
+#    Use for ad-hoc invocation, debugging, programmatic ingest.
+  - name: "direct_call_triage"
+    target: "ticket_intake_agent"
+    description: "On-demand direct call to intake+triage+voice routing (llm) — bypasses upstream chain"
+
+  - name: "direct_call_sentiment"
+    target: "sentiment_agent"
+    description: "On-demand direct call to sentiment (llm) — bypasses upstream chain"
+
+  - name: "direct_call_knowledge"
+    target: "response_agent"
+    description: "On-demand direct call to KB retrieval + response draft (llm) — bypasses upstream chain"
+
+  - name: "direct_call_qa"
+    target: "qa_agent"
+    description: "On-demand direct call to qa (llm) — bypasses upstream chain"
+
+  - name: "direct_call_sla_watchdog"
+    target: "sla_watchdog_agent"
+    description: "On-demand direct call to sla_watchdog (n8n connector) — bypasses upstream chain"
+
+  # ── Lyzr-inspired agents (added in 2.3.x) ──
+  - name: "cross_channel_lookup"
+    target: "cross_channel_agent"
+    description: "Find this customer's threads across all channels — unify context"
+
+  - name: "phone_call_intake"
+    target: "ticket_intake_agent"
+    description: "Voice-channel intake: classify intent, urgency, route human/callback/self-serve"
+
+  - name: "generate_crm_case"
+    target: "crm_case_generator_agent"
+    description: "At ticket resolution — draft the structured CRM case for push to Salesforce/HubSpot/Zendesk"
+
+
+agents:
+
+  # YAML-FIRST: the former Python module kept a voice-call ledger in
+  # SQLite (logs/phone_calls.db). Dropped — the call record belongs in
+  # YOUR telephony + CRM (Twilio/Aircall call logs, Zendesk/Salesforce
+  # ticket timeline), not template SQLite. Every intake/classification
+  # rule the module enforced now lives in the prompt below.
+  ticket_intake_agent:
+    name: "ticket_intake_agent"
+    agent_type: "llm"
+    description: "Intake owner for EVERY channel — normalises inbound into a canonical Ticket, classifies intent + priority + specialist routing, and handles voice calls (human/callback/self-serve)"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    max_tokens: 1400
+    communication_type: "dual"          # classification stage talks peer-to-peer
+
+    # Hear inbound messages live off the async stream, in addition to the
+    # per-channel entry points. A channel webhook receiver writes each
+    # message onto support_events; intake wakes per event and runs the
+    # same normalise→classify pass.
+    listen_events:
+      - broker: "support_events"
+        stream: "support:inbound"
+        consumer_group: "support-intake"
+
+    prompt: |
+      You are the intake owner — the single front door for every
+      support channel, including voice. One role, three numbered
+      responsibilities. Infer which apply from the input: a voice-call
+      signature (transcript / call_id / customer_phone present) means
+      responsibility 3 with intake_mode "voice_call"; everything else
+      is responsibilities 1+2 in one pass with intake_mode "ticket".
+
+      RESPONSIBILITY 1 — normalise this inbound support contact into
+      a canonical Ticket:
+        - ticket_id: keep the upstream ticket_id when one is provided;
+          otherwise mint "tkt-" followed by 12 random hex characters
+        - customer_id: from CRM lookup OR channel handle. NEVER invent
+          a customer_id — leave empty if no match.
+        - channel: slack | email | chat | phone | web | discord |
+          telegram | whatsapp (lowercase; default "web" when not
+          stated; always "phone" in voice mode)
+        - channel_thread_id: so the reply posts back to the same thread
+        - raw_message: the customer message verbatim
+        - attachments: list of attachment refs
+        - account_tier: standard | named | enterprise (from CRM if
+          available; default "standard" when unknown)
+        - raw_payload: source payload verbatim for audit
+
+      RESPONSIBILITY 2 — classify the ticket you just normalised:
+        - intent: EXACTLY one of how_to | bug | billing | account |
+          cancel | feature_request | other. Anything outside this
+          taxonomy maps to "other".
+        - priority: EXACTLY one of low | normal | high | urgent
+          (default "normal" when unsure).
+        - HARD-ESCALATION RULE (overrides your own judgment): if the
+          message contains any of these words — legal, lawsuit,
+          regulator, GDPR, CCPA, harm, injured, threatening, abuse,
+          breach, leak, ransomware — copy every hit verbatim into
+          escalation_keywords AND force priority to "urgent" unless
+          it is already high or urgent. Also list cancel / refund
+          verbatim in escalation_keywords when present (these do NOT
+          force-bump priority on their own).
+        - requires_specialist: true if intent is billing / account /
+          cancel, OR account_tier is enterprise, OR the issue is
+          security / legal in nature.
+        - specialist_topic: the domain (billing, security, ...) when
+          requires_specialist=true, else empty.
+        - routing_briefing: ALWAYS write 2-3 sentences for the support
+          agent picking this up — lead with intent + priority, then
+          the escalation keywords found (or "no escalation keywords"),
+          then whether it needs specialist review or is front-line
+          resolvable, and suggest the first action.
+        - escalation_reason: echo the upstream escalation_reason
+          verbatim when one was provided; otherwise repeat
+          routing_briefing.
+
+      RESPONSIBILITY 3 — voice-call intake (only when the input is a
+      voice call):
+        - FAIL CLOSED on missing transcript: if the call has no
+          transcript (failed STT), return intent
+          "unknown_no_transcript", priority "urgent", urgency 0.8,
+          disposition "human", requires_human_now true and
+          spoken_reply "Let me connect you with a specialist."
+        - intent: short snake_case (order_status, billing_query, ...)
+        - urgency: 0..1 — NEVER above 1 (no 0-10 scales). Score at
+          least 0.7 when the transcript contains urgency keywords as
+          WHOLE WORDS — emergency, urgent, now, immediately, down,
+          outage, broken, can't access, locked out, fraud, stolen,
+          lost, danger, lawsuit, lawyer, press, ceo — or shouting
+          (3+ ALL-CAPS words, or 2+ exclamation marks). Whole words
+          only: "now" inside "know" or "down" inside "download" does
+          not count. Anchors: 0.8 = high, 0.5 = mid, 0.2 = low.
+        - disposition, decided in this order:
+            1. urgency >= 0.7 → "human", spoken_reply "Let me get a
+               specialist on the line right now. One moment."
+            2. intent is one of order_status, tracking, store_hours,
+               return_policy, password_reset, billing_history AND
+               urgency < 0.4 AND you can answer in 1-2 sentences →
+               "self_serve" with that answer as spoken_reply. If you
+               cannot answer it → "human" with "Let me connect you
+               with a specialist."
+            3. everything else → "callback", spoken_reply "Thanks for
+               reaching out. We have you in the queue. A specialist
+               will call you back at <customer_phone, or 'your
+               number'> within 15 minutes. Reference number is
+               <call_id>."
+        - the HARD-ESCALATION RULE applies to transcripts too:
+          keyword hits go in escalation_keywords; priority is
+          "urgent" when urgency >= 0.7 or any hard keyword was found,
+          else "normal".
+        - raw_message: the transcript verbatim
+        - transcript_chars: length of the transcript in characters
+        - requires_human_now: true exactly when disposition is "human"
+        - requires_callback: true exactly when disposition is "callback"
+        - handled_at_utc: current UTC time, ISO-8601
+        - routing_briefing AND escalation_reason: "voice call —
+          <intent> intent, urgency <n>, disposition <d>" plus any
+          escalation keywords found.
+
+      Voice-mode keys are vacuous in ticket mode (empty / 0 / false)
+      and the ticket-route edges are gated on intake_mode, so the two
+      modes never cross-fire. Return JSON with ALL keys on every path.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"intake_mode": "", "ticket_id": "", "customer_id": "", "channel": "", "channel_thread_id": "", "raw_message": "", "attachments": [], "account_tier": "", "raw_payload": {}, "intent": "", "priority": "", "requires_specialist": false, "specialist_topic": "", "escalation_keywords": [], "routing_briefing": "", "escalation_reason": "", "call_id": "", "customer_phone": "", "urgency": 0, "disposition": "", "spoken_reply": "", "transcript_chars": 0, "requires_human_now": false, "requires_callback": false, "handled_at_utc": ""}
+
+    enforce_yields: true
+    enforce_yields_retry: 3
+
+    # Kept the classification taxonomy group (the role's core skill);
+    # the absorbed voice agent's support_kb grounding lives on in
+    # response_agent, which still drafts every customer-facing answer.
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "intent_taxonomy"
+
+    yields:
+      # Mode marker — 'ticket' | 'voice_call' (keeps modes from cross-firing)
+      intake_mode: "string"
+      # Responsibility 1 — canonical Ticket
+      ticket_id: "string"
+      customer_id: "string"
+      channel: "string"
+      channel_thread_id: "string"
+      raw_message: "string"
+      attachments: "list"
+      account_tier: "string"
+      raw_payload: "object"
+      # Responsibility 2 — triage classification
+      intent: "string"
+      priority: "string"
+      requires_specialist: "boolean"
+      specialist_topic: "string"
+      escalation_keywords: "list"
+      routing_briefing: "string"
+      # Identity passthrough — queue_manager inbox needs WHICH ticket + WHY
+      escalation_reason: "string"
+      # Responsibility 3 — voice-call routing (vacuous in ticket mode)
+      call_id: "string"
+      customer_phone: "string"
+      urgency: "number"
+      disposition: "string"             # self_serve | human | callback
+      spoken_reply: "string"
+      transcript_chars: "number"
+      requires_human_now: "boolean"
+      requires_callback: "boolean"
+      handled_at_utc: "string"
+
+    inputs:
+      payload: "object"
+      upstream_yields: "object"
+      transcript: "string"
+      call_id: "string"
+      customer_phone: "string"
+
+    context_parts:
+      guardrails: |
+        Never quote customer message contents in logs (privacy). Use
+        the canonical ticket_id as the operator-visible identifier.
+
+    narration: |
+      If escalation_keywords contains legal / regulator / breach /
+      GDPR / harm — route directly to queue_manager_human and copy
+      sme_human regardless of LLM-classified priority. The legal /
+      regulatory surface is a human gate, no exceptions — voice
+      transcripts included.
+      A customer (caller or writer) who sounds furious or threatens
+      to leave but trips no hard keyword and no urgency threshold
+      still deserves the escalation path — consider
+      queue_manager_human alongside the normal route.
+
+    can_call:
+      # Sentiment fires in parallel from the same event (kept fan-out)
+      - agent: "sentiment_agent"
+        condition: "true"
+
+      # Ticket mode, HARD-ESCALATION GATE (the narration's promise, now
+      # enforced as an edge): any escalation keyword (legal / breach /
+      # GDPR / harm / …) goes straight to a human — never to the bot —
+      # regardless of intent. Mutually exclusive with the response edge.
+      - agent: "queue_manager_human"
+        condition: "calling_agent_response.intake_mode == 'ticket' and calling_agent_response.intent != 'cancel' and calling_agent_response.escalation_keywords != []"
+
+      # Ticket mode: non-cancel, no escalation keyword → response_agent (KB retrieval + draft)
+      - agent: "response_agent"
+        condition: "calling_agent_response.intake_mode == 'ticket' and calling_agent_response.intent != 'cancel' and calling_agent_response.escalation_keywords == []"
+
+      # Ticket mode: cancel intent → queue manager directly (retention path)
+      - agent: "queue_manager_human"
+        condition: "calling_agent_response.intake_mode == 'ticket' and calling_agent_response.intent == 'cancel'"
+
+      # Voice mode: high urgency / IVR escape → human now
+      - agent: "tier_1_agent_human"
+        condition: "calling_agent_response.requires_human_now == true"
+
+      # Voice mode: capacity exceeded → callback booked, human follows up
+      - agent: "tier_1_agent_human"
+        condition: "calling_agent_response.requires_callback == true"
+
+      # Voice mode: self-serve → confirm-and-log via response_agent
+      - agent: "response_agent"
+        condition: "calling_agent_response.disposition == 'self_serve'"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  sentiment_agent:
+    name: "sentiment_agent"
+    agent_type: "llm"
+    description: "Scores urgency / frustration; flags churn risk"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 400
+    communication_type: "chain"
+
+    prompt: |
+      Score the customer message:
+        - frustration: 0..1
+        - urgency: 0..1
+        - polite: boolean — is the customer courteous?
+        - churn_risk: 0..1 (mentions of cancel, frustration, "last time")
+
+      Every numeric score MUST stay within 0 and 1 — never use a 0-10
+      scale. In cited_phrases, quote the specific verbatim phrases
+      that drove each score.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"frustration": 0, "urgency": 0, "polite": false, "churn_risk": 0, "cited_phrases": []}
+
+    enforce_yields: true
+    enforce_yields_retry: 1
+
+    yields:
+      frustration: "number"
+      urgency: "number"
+      polite: "boolean"
+      churn_risk: "number"
+      cited_phrases: "list"
+
+    inputs:
+      upstream_yields: "object"
+
+    # Sentiment is a co-input to response, not a sequential gate
+    can_call: []
+
+  response_agent:
+    name: "response_agent"
+    agent_type: "llm"
+    description: "Retrieves the grounded KB answer AND drafts the customer reply (knowledge-grounded, tone-aware)"
+    model: "gpt-4o-mini"
+    temperature: 0.3
+    max_tokens: 1800
+    communication_type: "dual"
+
+    # Fan-in — wait for intake (intent + priority); sentiment is optional context
+    wait_for: "ticket_intake_agent AND sentiment_agent?"
+    wait_for_timeout: 60
+
+    prompt: |
+      Two stages, one pass.
+
+      STAGE 1 — retrieval: find the right answer for this ticket from
+      the knowledge base (docs, runbook, prior solved tickets). Cite
+      each source. If you can't find a confident answer
+      (confidence < 0.7), say so explicitly — don't make something
+      up. Downstream will escalate to a Tier-2 specialist.
+
+      STAGE 2 — draft the customer reply, grounded ONLY in what
+      stage 1 retrieved.
+
+      Field rules (all keys required):
+        - answer_outline: the grounded answer skeleton
+        - cited_sources: list of source IDs / URLs the reply cites
+        - confidence: 0..1 retrieval confidence — never above 1.
+          NO-SOURCE-NO-ANSWER FLOOR: if cited_sources is empty,
+          confidence MUST NOT exceed 0.4.
+        - knowledge_gap: true whenever no good source was found OR
+          confidence < 0.5
+        - reply_body: the draft customer-facing reply (3-5 short
+          paragraphs)
+        - tone_used: EXACTLY one of empathetic | concise | technical
+          | warm (default "warm")
+        - suggested_followup: next step if customer needs more help
+        - ticket_id: echo the upstream ticket_id verbatim — the
+          tier-2 specialist needs WHICH ticket on escalation
+
+      Adapt tone based on sentiment:
+        frustration >= 0.6 → start with empathy
+        polite=true → match the customer's tone
+        urgency >= 0.7 → lead with the answer, then explanation
+
+      Always cite the source (link or doc title) when citing policy
+      or steps. Never promise a roadmap commitment or a discount.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"answer_outline": "", "cited_sources": [], "confidence": 0, "knowledge_gap": false, "reply_body": "", "tone_used": "", "suggested_followup": "", "ticket_id": ""}
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "support_kb"
+
+    yields:
+      answer_outline: "string"
+      cited_sources: "list"
+      confidence: "number"              # 0..1 retrieval confidence
+      knowledge_gap: "boolean"          # true if no good source found
+      reply_body: "string"
+      tone_used: "string"               # empathetic | concise | technical | warm
+      suggested_followup: "string"      # next step if customer needs more help
+      # Identity passthrough — tier-2 specialist sees WHICH ticket
+      ticket_id: "string"
+
+    inputs:
+      upstream_yields: "object"
+
+    context_parts:
+      guardrails: |
+        Never invent product features or commitments. If the customer
+        asks about a feature not in the KB, route to feature_request
+        intent — don't promise something.
+
+    can_call:
+      # Confident, grounded draft → QA gate
+      - agent: "qa_agent"
+        condition: "calling_agent_response.confidence >= 0.7"
+
+      # Low retrieval confidence → tier_2_specialist takes it
+      - agent: "tier_2_specialist_human"
+        condition: "calling_agent_response.confidence < 0.7"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  qa_agent:
+    name: "qa_agent"
+    agent_type: "llm"
+    description: "Tone / accuracy / policy / PII gate before the customer sees the reply"
+    model: "gpt-4o-mini"
+    temperature: 0.0
+    max_tokens: 800
+    communication_type: "chain"
+
+    prompt: |
+      QA the draft reply:
+        - Accuracy: does the reply match the KB sources response_agent cited?
+        - Tone: appropriate for the sentiment scored? Set
+          tone_acceptable accordingly.
+        - PII SWEEP (be exhaustive — humans miss things, you must
+          not): scan the reply body for ANY email address (record as
+          "email:<address>") and ANY account / customer identifier —
+          patterns like "account id: ABC123", "acc-num 4452-...",
+          "customer number: X9-..." (record as "account_id:<value>").
+          Also flag third-party personal names. Every hit goes in
+          pii_concerns, deduplicated.
+        - POLICY SWEEP: if the reply body contains any of these
+          phrases — discount, refund, free upgrade, roadmap commit,
+          guarantee — record each as "policy_word:<word>" in
+          policy_concerns. Promises beyond what's authorised
+          (discounts, roadmap commitments, refunds outside policy)
+          are policy concerns too.
+        - Length: under 5 short paragraphs?
+
+      CARDINAL RULE: if pii_concerns or policy_concerns is non-empty,
+      approved MUST be false — no exceptions — and issues must note
+      the counts (e.g. "pii_detected:2", "policy_violation:1").
+      approved=true only if ALL checks pass. Otherwise list specific
+      issues so response_agent can rewrite.
+
+      Echo upstream values verbatim: ticket_id (tier-1 reviews THIS
+      ticket) and reply_body (the exact draft you reviewed).
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"approved": false, "issues": [], "tone_acceptable": false, "pii_concerns": [], "policy_concerns": [], "ticket_id": "", "reply_body": ""}
+
+    enforce_yields: true
+    enforce_yields_retry: 2
+
+    yields:
+      approved: "boolean"
+      issues: "list"
+      tone_acceptable: "boolean"
+      pii_concerns: "list"
+      policy_concerns: "list"
+      # Identity passthrough — tier-1 reviews THIS reply for THIS ticket
+      ticket_id: "string"
+      reply_body: "string"
+
+    inputs:
+      upstream_yields: "object"
+
+    narration: |
+      pii_concerns or policy_concerns being non-empty ALWAYS routes
+      to a human review — never auto-send a reply with PII or
+      out-of-policy promises.
+
+    can_call:
+      # Clean reply → tier 1 reviews and sends (HITL gate before customer)
+      - agent: "tier_1_agent_human"
+        condition: "calling_agent_response.approved == true and calling_agent_response.pii_concerns == []"
+
+      # Issues found → tier 1 still reviews but with the issues called out
+      - agent: "tier_1_agent_human"
+        condition: "calling_agent_response.approved == false"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  tier_1_agent_human:
+    name: "tier_1_agent_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Tier-1 support agent — reviews + sends reply"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 1800         # 30 min — tickets shouldn't stall
+
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_tier_2"
+      message: "escalate_to_tier_2"
+      note: "Tier-1 didn't respond — escalating to Tier-2"
+
+    yields:
+      decision: "string"                # sent | edit_and_send | escalate_to_tier_2 | reject
+      sent_at_utc: "string"
+
+    inputs:
+      ticket_id: "string"
+      reply_body: "string"
+      channel: "string"
+      channel_thread_id: "string"
+
+    can_call:
+      - agent: "tier_2_specialist_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_tier_2'"
+
+      # APPROVED → the executor that actually sends. Approval is not
+      # delivery: tier-1 signs off, reply_dispatcher_agent FINISHES the
+      # job (sends on the arrival channel, in-thread, logs to the ticket).
+      # The dispatcher's fail-closed floor re-checks approval + PII before
+      # it sends, so a reject / escalate that slips through is blocked.
+      - agent: "reply_dispatcher_agent"
+        condition: "calling_agent_response.human_message != 'escalate_to_tier_2'"
+
+  tier_2_specialist_human:
+    name: "tier_2_specialist_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Tier-2 specialist — domain depth (billing, security, account)"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 7200
+
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "escalate_to_sme"
+      message: "escalate_to_sme"
+      note: "Tier-2 didn't respond — escalating to SME"
+
+    yields:
+      decision: "string"
+      notes: "string"
+
+    inputs:
+      ticket_id: "string"
+
+    can_call:
+      - agent: "sme_human"
+        condition: "calling_agent_response.human_message == 'escalate_to_sme'"
+
+      - agent: "support_audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'escalate_to_sme'"
+
+  sme_human:
+    name: "sme_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Tier-3 SME — engineering / security / legal escalation"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 14400
+
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "halt_for_review"
+      message: "halt_for_review"
+      note: "SME unavailable — ticket paused for personal review"
+
+    yields:
+      decision: "string"
+      notes: "string"
+
+    inputs:
+      ticket_id: "string"
+      specialist_topic: "string"
+
+    can_call:
+      - agent: "support_audit_logger_agent"
+
+  queue_manager_human:
+    name: "queue_manager_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Queue manager — owns escalations, cancel-intent, SLA breaches"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 3600
+
+    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
+    #   gate to the SHARED inbox. Only set real operator emails: a
+    #   placeholder assigns tasks to a nonexistent operator and they
+    #   never appear in anyone's inbox.
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "halt_for_review"
+      message: "halt_for_review"
+      note: "Queue manager unavailable — ticket halted (default-deny)"
+
+    yields:
+      decision: "string"
+      directive: "string"
+
+    inputs:
+      ticket_id: "string"
+      escalation_reason: "string"
+
+    can_call:
+      - agent: "support_audit_logger_agent"
+
+  support_audit_logger_agent:
+    name: "support_audit_logger_agent"
+    agent_type: "external"
+    description: "Hash-chained WORM audit of every reply sent + escalation"
+    framework: "custom"
+    communication_type: "execute"
+
+    connector_config:
+      sink_type: "local_file"
+      local_file_path: "./logs/support_audit.jsonl"
+
+    yields:
+      audit_event_id: "string"
+      written_at_utc: "string"
+      hash_chain_prev: "string"
+      hash_chain_current: "string"
+
+    inputs:
+      session_id: "string"
+      payload: "object"
+
+    can_call: []
+
+  # ────────────────────────────────────────────────────────────
+  # reply_dispatcher_agent — the EGRESS ACTUATOR. The team drafts
+  # (response), clears (qa) and a human approves (tier-1) a reply —
+  # but approval is NOT delivery. This role FINISHES the job: it sends
+  # the approved reply on the channel the ticket arrived on, in-thread,
+  # and logs the send to the ticket. Async / closed-session tickets
+  # (e.g. email) are batched — the comms platform bulk-sends.
+  #
+  # Connector: COMMS_DISPATCH_WEBHOOK_URL — a comms dispatcher / CPaaS
+  # (Slack postMessage, your email gateway, Twilio/EmailBison). Inert
+  # until set; until then agency/reply_dispatcher_agent.py's dev-store
+  # fallback RECORDS the send to ./data/outbox.json so the full chain
+  # runs day-0 and the artifact is verifiable. The matching module
+  # auto-binds (agent_type programmatic + agency/<name>.py) and carries
+  # the deterministic FAIL-CLOSED floor: never dispatch a reply that
+  # wasn't approved or that has unresolved PII / policy concerns.
+  # ────────────────────────────────────────────────────────────
+  reply_dispatcher_agent:
+    name: "reply_dispatcher_agent"
+    agent_type: "programmatic"
+    description: "Egress actuator — SENDS the approved reply on its arrival channel (in-thread, batched when async), logs it to the ticket; fail-closed on unapproved / PII"
+    communication_type: "chain"
+    integration: "n8n"
+    connector_config:
+      webhook_url: "${COMMS_DISPATCH_WEBHOOK_URL:}"
+
+    yields:
+      dispatch_id: "string"
+      ticket_id: "string"
+      channel: "string"
+      channel_thread_id: "string"
+      delivery_mode: "string"           # in_thread | batched | blocked
+      sent: "boolean"
+      send_status: "string"             # recorded | connector_sent | blocked
+      dispatched_at_utc: "string"
+      dispatch_reason: "string"
+
+    inputs:
+      upstream_yields: "object"
+      ticket_id: "string"
+      channel: "string"
+      channel_thread_id: "string"
+      reply_body: "string"
+
+    can_call:
+      # Sent (or recorded-sent) OR fail-closed block → audit terminus.
+      # The WORM log records every send AND every blocked dispatch.
+      - agent: "support_audit_logger_agent"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # sla_watchdog_agent — connector, not code. SLA clocks live in
+  # YOUR support desk (Zendesk SLA policies / Intercom SLA rules),
+  # not in template Python. The n8n workflow queries that API for
+  # tickets past SLA and returns JSON in exactly the declared
+  # yields shape (lenient yields fills anything it omits).
+  # ────────────────────────────────────────────────────────────
+  sla_watchdog_agent:
+    name: "sla_watchdog_agent"
+    agent_type: "programmatic"
+    description: "Scans your support desk (Zendesk SLA policies via n8n) for tickets past SLA and reports breaches"
+    communication_type: "execute"
+    # wake_up: "*/1 * * * *"   # enable after wiring your Zendesk SLA connector
+    integration: "n8n"
+    connector_config:
+      webhook_url: "${N8N_SLA_WATCHDOG_WEBHOOK_URL:}"
+
+    yields:
+      breached_count: "number"
+      breached_ticket_ids: "list"
+
+    inputs:
+      trigger: "string"
+
+    can_call: []
+
+  # ────────────────────────────────────────────────────────────
+  # kb_gap_filler_agent — when response_agent's KB retrieval returns nothing,
+  # draft the NEW KB article from how the ticket got resolved.
+  # Closes the loop on knowledge debt. Real-world support pain.
+  # ────────────────────────────────────────────────────────────
+  kb_gap_filler_agent:
+    name: "kb_gap_filler_agent"
+    agent_type: "llm"
+    description: "When KB had no answer, drafts the article from the resolution path (HITL reviewed)"
+    model: "gpt-4o-mini"
+    temperature: 0.2
+    max_tokens: 1200
+    communication_type: "chain"
+
+    prompt: |
+      A support ticket got resolved AND response_agent's KB retrieval
+      had returned knowledge_gap=true — meaning we didn't have an article
+      for this. Draft the article we should have had:
+        - article_title: short, search-friendly
+        - problem_statement: the customer pain in their words
+        - resolution_steps: numbered list (specific, copy-pasteable)
+        - prerequisites: anything the customer needs first
+        - related_articles: list of slugs that link nearby
+        - suggested_kb_section: which KB section this goes under
+        - confidence: 0..1 in completeness — never above 1.
+          QUALITY FLOOR: an article with zero resolution_steps is not
+          useful — if resolution_steps is empty, confidence MUST NOT
+          exceed 0.4.
+
+      Write for the next customer who'll search this. Not for an
+      internal engineer.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"article_title": "", "problem_statement": "", "resolution_steps": [], "prerequisites": [], "related_articles": [], "suggested_kb_section": "", "confidence": 0}
+
+    enforce_yields: true
+    enforce_yields_retry: 1
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "kb_style_guide"
+
+    yields:
+      article_title: "string"
+      problem_statement: "string"
+      resolution_steps: "list"
+      prerequisites: "list"
+      related_articles: "list"
+      suggested_kb_section: "string"
+      confidence: "number"
+
+    inputs:
+      resolved_ticket: "object"
+
+    can_call:
+      # KB editor / queue manager reviews draft before publishing
+      - agent: "queue_manager_human"
+
+  # ────────────────────────────────────────────────────────────
+  # support_insights_agent — connector, not code. CSAT/NPS rollups
+  # and ticket-cluster trends live in YOUR support desk's analytics
+  # API (Zendesk Explore / Intercom reports), not in template SQLite
+  # (the former module's two-ledger SQLite store is gone). The n8n
+  # workflow queries that analytics API — honouring the mode input
+  # (csat_ingest | cluster_ingest | report) — and returns JSON in
+  # exactly the declared yields shape (lenient yields fills anything
+  # it omits, so the spike→kb_gap_filler edge always evaluates).
+  # ────────────────────────────────────────────────────────────
+  support_insights_agent:
+    name: "support_insights_agent"
+    agent_type: "programmatic"
+    description: "Support insights analyst — CSAT/NPS rollups AND trending/spiking ticket clusters, read from your support desk's analytics (Zendesk Explore / Intercom) via n8n. Modes: csat_ingest | cluster_ingest | report"
+    communication_type: "chain"
+    integration: "n8n"
+    connector_config:
+      webhook_url: "${N8N_SUPPORT_INSIGHTS_WEBHOOK_URL:}"
+    yields:
+      mode: "string"
+      # Responsibility 1 — CSAT/NPS ledger + rollups
+      customer_id: "string"
+      customer_recent_band: "string"
+      customer_avg_score: "number"
+      rolling_30d: "object"
+      rolling_90d: "object"
+      csat_briefing: "string"
+      # Responsibility 2 — ticket-cluster trends
+      total_24h: "number"
+      total_7d: "number"
+      trending_clusters: "list"
+      spike_count: "number"
+      spike_clusters: "list"
+      clustering_briefing: "string"
+    inputs:
+      mode: "string"
+      ticket_id: "string"
+      customer_id: "string"
+      survey_kind: "string"
+      score: "number"
+      comment: "string"
+      channel: "string"
+      intent: "string"
+      product_area: "string"
+      error_code: "string"
+      raw_summary: "string"
+      raw_message: "string"
+    can_call:
+      # Spike → kb_gap_filler likely needs a new article AND signals possible regression
+      - agent: "kb_gap_filler_agent"
+        condition: "calling_agent_response.spike_count > 0"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # cross_channel_agent — connector, not code. Customer identity
+  # resolution lives in YOUR CRM (Salesforce / Segment unified
+  # profiles), not in template SQLite (the former module's thread
+  # ledger is gone). The n8n workflow resolves the customer by
+  # customer_id / email / phone in that CRM and returns the linked
+  # threads as JSON in exactly the declared yields shape (lenient
+  # yields fills anything it omits, so the requires_thread_merge
+  # edges always evaluate).
+  # ────────────────────────────────────────────────────────────
+  cross_channel_agent:
+    name: "cross_channel_agent"
+    agent_type: "programmatic"
+    description: "Unifies customer threads across email, Slack, Zendesk, WhatsApp into one context — identity resolved in your CRM (Salesforce / Segment) via n8n"
+    communication_type: "chain"
+    integration: "n8n"
+    connector_config:
+      webhook_url: "${N8N_CROSS_CHANNEL_WEBHOOK_URL:}"
+
+    yields:
+      customer_key: "string"
+      current_channel: "string"
+      linked_threads: "list"
+      linked_count: "number"
+      channels_seen: "list"
+      has_open_elsewhere: "boolean"
+      history_summary: "string"
+      requires_thread_merge: "boolean"
+
+    inputs:
+      upstream_yields: "object"
+      customer_email: "string"
+      customer_phone: "string"
+      customer_id: "string"
+      ticket_id: "string"
+      channel: "string"
+
+    can_call:
+      # Continue to response with unified context
+      - agent: "response_agent"
+        condition: "calling_agent_response.requires_thread_merge == false"
+
+      # Open thread elsewhere → senior agent merges first
+      - agent: "queue_manager_human"
+        condition: "calling_agent_response.requires_thread_merge == true"
+
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ────────────────────────────────────────────────────────────
+  # crm_case_generator_agent — DRAFTS the CRM record on resolution.
+  # The former module also wrote the case into a local SQLite table —
+  # dropped: case creation belongs in YOUR support desk / CRM
+  # (Salesforce / HubSpot / Zendesk) via the connector agents; this
+  # agent only produces the structured, push-ready case record.
+  # ────────────────────────────────────────────────────────────
+  crm_case_generator_agent:
+    name: "crm_case_generator_agent"
+    agent_type: "llm"
+    description: "At ticket resolution — drafts categorised CRM case for push to Salesforce / HubSpot / Zendesk"
+    model: "claude-haiku-4-5"
+    temperature: 0.0
+    max_completion_tokens: 1500
+    communication_type: "chain"
+
+    prompt: |
+      Generate the CRM case record from the resolved ticket.
+
+      CATEGORY TAXONOMY (category → allowed subcategories):
+        billing: payment_failed, refund, subscription_change,
+                 invoice_dispute, tax_query
+        technical: bug_report, feature_request, performance,
+                   integration_issue, data_loss
+        account: password_reset, access_revoked, user_provisioning,
+                 permission_change, sso_setup
+        product: how_to, feature_walkthrough, use_case, best_practice,
+                 migration_guidance
+        service: sla_breach, outage_followup, downgrade, cancellation
+      Normalisation rules: category MUST be one of the five above and
+      subcategory MUST belong to that category. If your subcategory
+      is not in the chosen category's list, use the FIRST subcategory
+      of that category. If only the subcategory is recognisable,
+      infer its category from the taxonomy. Ultimate fallback:
+      category "product", subcategory "how_to".
+
+      Field rules:
+        - case_id: "case-<ticket_id>-<unix epoch seconds>". If there
+          is NO upstream ticket_id, leave case_id and ticket_id empty
+          and set ready_for_crm_push false.
+        - ticket_id / customer_key / csat_score: echo upstream values
+          verbatim (csat_score 0 when absent).
+        - product_feature: which product area the case was about
+        - sentiment_trajectory: from the upstream sentiment scores
+          across the ticket — "improved" (final minus first >= 0.2),
+          "degraded" (first minus final >= 0.2),
+          "consistently_positive" (all >= 0.4),
+          "consistently_negative" (all <= -0.2), else "neutral";
+          "unknown" when no sentiment data is available.
+        - kb_articles_cited: list of KB article IDs referenced
+        - resolution_summary: 2-4 sentences. What was wrong, what
+          we did, what the customer can do to avoid recurrence.
+        - time_to_resolve_minutes: from the upstream opened/resolved
+          timestamps (0 when unknown; never negative)
+        - generated_at_utc: current UTC time, ISO-8601
+        - ready_for_crm_push: true ONLY when resolution_summary,
+          category and subcategory are all non-empty.
+
+      Be specific. "Resolved per workflow" is useless to the next person
+      who searches this case. Cite the exact KB step that worked.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+
+      {"case_id": "", "ticket_id": "", "customer_key": "", "category": "", "subcategory": "", "product_feature": "", "sentiment_trajectory": "", "kb_articles_cited": [], "resolution_summary": "", "time_to_resolve_minutes": 0, "csat_score": 0, "generated_at_utc": "", "ready_for_crm_push": false}
+
+    enforce_yields: true
+
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "crm_taxonomy"
+
+    yields:
+      case_id: "string"
+      ticket_id: "string"
+      customer_key: "string"
+      category: "string"
+      subcategory: "string"
+      product_feature: "string"
+      sentiment_trajectory: "string"
+      kb_articles_cited: "list"
+      resolution_summary: "string"
+      time_to_resolve_minutes: "number"
+      csat_score: "number"
+      generated_at_utc: "string"
+      ready_for_crm_push: "boolean"
+
+    inputs:
+      upstream_yields: "object"
+      ticket_id: "string"
+      customer_key: "string"
+
+    can_call:
+      # On push-ready resolution, pull the insights rollup (CSAT + clusters)
+      - agent: "support_insights_agent"
+        condition: "calling_agent_response.ready_for_crm_push == true"
+
+    auto_store_response: true
+    auto_store_yields: true

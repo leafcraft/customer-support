@@ -1,0 +1,21 @@
+{
+  "_entry_point": "repeat_question_burst",
+  "_description": "Triggered when 3+ tickets in 24h ask the same novel question \u2014 kb_gap_filler_agent drafts a missing KB article for the support manager to publish.",
+  "payload": {
+    "signal_type": "repeat_question",
+    "question_cluster_id": "cluster-2026-06-04-rate-limit-headers",
+    "occurrence_count": 7,
+    "first_seen_utc": "2026-06-04T08:30:00Z",
+    "last_seen_utc": "2026-06-04T17:15:00Z",
+    "representative_question": "Where do I find the X-RateLimit-Remaining header in the API response?",
+    "tickets": [
+      "t-2391",
+      "t-2402",
+      "t-2415",
+      "t-2418",
+      "t-2422",
+      "t-2427",
+      "t-2433"
+    ]
+  }
+}
