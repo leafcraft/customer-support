@@ -5,6 +5,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .hypothesis/
+# Runtime artifacts — the dev-store outbox/backlog, rendered replies, WORM log.
+# These are dev stand-ins, never a system of record; never commit them.
+data/
+out/
 logs/
 *.log
 .DS_Store

@@ -1,9 +1,18 @@
-"""customer-support — Customer Support (reactive ticket triage).
+"""customer-support — Customer-Support Pod (LeafMesh).
 
-YAML-FIRST mesh: every agent is defined entirely in configs/config.yaml
-(LLM prompts carry the business rules; insights / SLA / cross-channel
-are n8n connector agents backed by your support desk + CRM). The only
-Python is the hash-chained WORM audit sink registered below.
+Boot order matters (SDK 2.4.131):
+  1. import agency.tools  → the @global_tool decorators run BEFORE from_yaml/start,
+     so response_agent's search_kb / read_past_tickets and backlog_triage's
+     claim_ticket_batch are registered.
+  2. LeafMesh.from_yaml(...) → auto_discover wires the finisher
+     agency/reply_dispatcher_agent.py to the YAML.
+  3. audit_logger.register(...) → attach the WORM sink to the custom external
+     support_audit_logger_agent (after from_yaml, before start).
+  4. leafmesh.start().
+
+YAML-FIRST: every agent is defined in configs/config.yaml; the only Python is the
+finisher (reply_dispatcher_agent.py), the WORM sink (agency/_shared), and the
+day-0 dev-store tools (agency/tools.py + agency/_shared/store.py).
 """
 import asyncio
 import signal
@@ -12,6 +21,7 @@ import sys
 from dotenv import load_dotenv
 from leafmesh import EventType, LeafMesh, LeafMeshLogger
 
+import agency.tools  # noqa: F401 — registers @global_tool tools before start()
 from agency._shared import audit_logger as _audit_logger
 
 load_dotenv()

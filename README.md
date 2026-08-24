@@ -31,14 +31,16 @@ the cost of trust or compliance. The payoff is measurable: tickets
 deflected, faster first response, fewer escalations, and a self-healing
 knowledge base (gaps become drafted articles).
 
-## The team (15 agents)
+## The team (17 agents)
 
 | Agent | Role | Responsibilities | Can perform |
 |---|---|---|---|
+| `case_coordinator_agent` | Case coordinator (single point of contact) | Own each ticket end-to-end: open the case, record arrival channel + time, orchestrate the pod, keep live status, answer "where is my ticket?" | LLM; listens on the `support_events` stream; opens cases → intake; routes exceptions → queue_manager, security/legal → SME (never triages/drafts/sends itself) |
 | `ticket_intake_agent` | Front door for every channel (incl. voice) | Normalise any channel payload → canonical Ticket; classify intent / priority / specialist; scan hard-escalation keywords; route voice calls (human / callback / self-serve; fail-closed on no transcript) | LLM (intent_taxonomy KB); listens on the `support_events` stream; fans out to sentiment; routes to response / queue_manager (escalation or cancel) / tier-1 (voice) |
 | `sentiment_agent` | Emotional read | Score frustration / urgency / churn_risk / polite; cite the phrases that drove each score | LLM; parallel co-input to response (no routing of its own) |
 | `response_agent` | Knowledge-grounded answer + draft | Retrieve the answer from the KB (cite sources; no source ⇒ confidence ≤ 0.4); draft the tone-aware reply in one pass | LLM (support_kb RAG); fan-in waits for intake (+ sentiment); routes to QA (conf ≥ 0.7) or tier-2 (< 0.7) |
-| `qa_agent` | Pre-send safety gate | Check accuracy vs cited sources + tone; exhaustive PII sweep; policy-word probe; block on any PII/policy hit | LLM; routes approved or flagged drafts to tier-1 |
+| `qa_agent` | Pre-send safety gate | Check accuracy vs cited sources + tone; exhaustive PII sweep; policy-word probe; block on any PII/policy hit; bounded QA-rework back-edge to response (exhaustion → queue_manager) | LLM; routes approved or flagged drafts to tier-1 |
+| `backlog_triage_agent` | Bulk triage drainer | Drain the queued-ticket backlog: N parallel copies each atomically CLAIM a disjoint batch (never duplicate work), triage each, escalate the worthy ones | LLM (`instances: 3`, atomic `claim_ticket_batch`); scheduled sweep in the business timezone; routes escalations → queue_manager, drain counts → audit |
 | `tier_1_agent_human` | Tier-1 operator | Review + approve the reply; escalate when needed | Human (channel-native HITL); approve → reply_dispatcher; default-deny fallback → tier-2 |
 | `reply_dispatcher_agent` | Egress actuator | SEND the approved reply on the channel it arrived on (in-thread; batched when async/email), log it to the ticket; fail-closed on unapproved / unresolved PII | Programmatic (COMMS_DISPATCH_WEBHOOK_URL; Slack/email/CPaaS), dev-store outbox fallback; terminus → audit |
 | `tier_2_specialist_human` | Tier-2 specialist | Billing / security / account depth; escalate to SME | Human; fallback → SME |
@@ -95,11 +97,43 @@ direct calls.
   from Zendesk/Intercom + Salesforce/Segment via n8n connectors; the
   template keeps no shadow SQLite ledgers
 
-## Quick start
+## Configuration — what to set, in three tiers
+
+Everything is set in `.env` (`cp env .env`). The **whole LLM chain (intake →
+sentiment → response → QA) runs on Tier 1 alone** against the seed KB / backlog
+store (`./data`); KB reads, the egress send, and the CSAT / SLA / cross-channel
+connectors use dev stand-ins that **announce themselves** until you wire Tiers 2–3.
+
+### Tier 1 — required to boot (dev mode)
+| Setting | For | Notes |
+|---|---|---|
+| `LEAFMESH_LICENSE_KEY` | LeafMesh runtime | **Required.** |
+| `OPENAI_API_KEY` | Coordinator + intake + QA + backlog + Manager (`gpt-4o-mini`) | **Required.** |
+| `ANTHROPIC_API_KEY` | response_agent (Claude) | **Required** unless you change the model. |
+| `REDIS_HOST` / `PORT` / `PASSWORD` | State store | Defaults to `localhost:6379`. `docker run -d -p 6379:6379 redis:7-alpine`. |
+| `SUPPORT_EVENTS_REDIS_URL` | Async inbound stream the Coordinator listens on | Defaults to local Redis. |
+
+### Tier 2 — real connectors (set the URL to go live; inert until then)
+| Setting | Enables |
+|---|---|
+| `DOCS_MCP_URL` / `_TOKEN` | Real docs/KB retrieval for response_agent (uncomment its `mcp` block) |
+| `COMMS_DISPATCH_WEBHOOK_URL` | The egress send — Slack postMessage / email gateway / CPaaS (Twilio/EmailBison) |
+| `N8N_SUPPORT_INSIGHTS_WEBHOOK_URL` | CSAT/NPS rollups + trending/spiking clusters |
+| `N8N_SLA_WATCHDOG_WEBHOOK_URL` | Tickets-past-SLA scan |
+| `N8N_CROSS_CHANNEL_WEBHOOK_URL` | Cross-channel identity resolution |
+
+> ⚠️ The SDK rejects an `mcp` block with an **empty** URL at load, so the block
+> ships **commented** in `configs/config.yaml`. Fill the URL, then uncomment.
+
+### Tier 3 — CRM push at resolution (later)
+`crm_case_generator_agent` drafts the push-ready CRM case; wire it to
+Salesforce / HubSpot / Zendesk when you are ready to write cases back.
+
+## Run it
 
 ```bash
 cp env .env
-pip install -r requirements.txt
+pip install -r requirements.txt          # core LeafMesh runs the pod day-0
 docker run -d -p 6379:6379 redis:7-alpine
 python main.py
 ```
