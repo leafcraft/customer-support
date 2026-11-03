@@ -12,10 +12,15 @@ success that looks like a real read (doctrine A4/A5).
 To go live, wire real RAG / a docs MCP (the commented mcp block on
 response_agent) and point the backlog claim at your support desk's queue; these
 dev tools are the fallback contract, and the function signatures do not change.
+
+"Is a real KB wired?" is answered from the vault, never from .env: it is wired
+when the vault record 'docs_mcp' exists (the record response_agent's mcp block
+uses — Infrastructure → Integrations → MCP).
 """
 import os
 
-from leafmesh import global_tool, LeafMeshLogger
+from leafmesh import LeafMeshLogger, SecretNotAllowed, connection_rows, global_tool
+from leafmesh.vault.refs import UnresolvedVaultRef
 
 try:
     from ._shared import store
@@ -27,13 +32,22 @@ except ImportError:  # pragma: no cover — direct-run fallback
 logger = LeafMeshLogger(__name__)
 
 
-def _kb_connector_wired() -> bool:
-    """True if a real KB/docs connector is configured (docs MCP URL set)."""
-    return bool(os.getenv("DOCS_MCP_URL"))
+_DOCS_RECORD = "docs_mcp"
+
+
+async def _kb_connector_wired() -> bool:
+    """True if the real KB/docs connector's vault record exists."""
+    try:
+        await connection_rows(_DOCS_RECORD)
+        return True
+    except UnresolvedVaultRef:
+        return False
+    except SecretNotAllowed:
+        return True    # the record exists; it only limits which agents read it
 
 
 @global_tool(category="knowledge")
-def search_kb(query: str) -> dict:
+async def search_kb(query: str) -> dict:
     """Search the knowledge base (docs, runbook) for articles matching a query.
 
     Returns matching articles with id, title, section, url, and body so the reply
@@ -44,7 +58,7 @@ def search_kb(query: str) -> dict:
         query: The customer's question or keywords to search for.
     """
     result = store.search_kb(str(query).strip())
-    if not result.get("hits") and _kb_connector_wired():
+    if not result.get("hits") and await _kb_connector_wired():
         # A connector IS wired but returned nothing — surface unreachable rather
         # than an empty-but-confident zero.
         return {"available": False,
@@ -68,9 +82,10 @@ def read_past_tickets(customer_id: str) -> dict:
 def claim_ticket_batch(count: int = 8) -> dict:
     """Atomically claim a batch of queued backlog tickets to triage.
 
-    The claim is concurrency-safe: when several parallel copies (instances: N)
+    The claim is concurrency-safe: when several parallel copies (scaling.copies.count: N)
     call it, each copy receives a DISJOINT batch, so copies never duplicate work.
-    Returns the claimed ticket ids and how many remain in the backlog.
+    Returns the claimed ticket ids, each ticket's content (channel, customer,
+    subject, message) and how many remain in the backlog.
 
     Args:
         count: How many backlog tickets this copy should claim (default 8).

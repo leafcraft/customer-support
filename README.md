@@ -7,7 +7,9 @@ parallel, and routes voice calls human/callback/self-serve;
 KB-grounded responses (retrieval + draft in one agent); QA gate before
 customer sees anything; channel-native HITL.
 
-**YAML-first**: `configs/config.yaml` IS the support desk. Every
+**YAML-first**: `configs/config.yaml` IS the support desk (it seeds the
+agency's stored configuration on the first start; after that you change it in
+Studio — see *Changing the configuration after the first start*). Every
 business rule lives in the agent prompts; ticket / CSAT / SLA /
 call-record state lives in YOUR support desk + telephony + CRM
 (Zendesk/Intercom, Twilio/Aircall, Salesforce) behind n8n connector
@@ -35,23 +37,25 @@ knowledge base (gaps become drafted articles).
 
 | Agent | Role | Responsibilities | Can perform |
 |---|---|---|---|
-| `case_coordinator_agent` | Case coordinator (single point of contact) | Own each ticket end-to-end: open the case, record arrival channel + time, orchestrate the pod, keep live status, answer "where is my ticket?" | LLM; listens on the `support_events` stream; opens cases → intake; routes exceptions → queue_manager, security/legal → SME (never triages/drafts/sends itself) |
-| `ticket_intake_agent` | Front door for every channel (incl. voice) | Normalise any channel payload → canonical Ticket; classify intent / priority / specialist; scan hard-escalation keywords; route voice calls (human / callback / self-serve; fail-closed on no transcript) | LLM (intent_taxonomy KB); listens on the `support_events` stream; fans out to sentiment; routes to response / queue_manager (escalation or cancel) / tier-1 (voice) |
-| `sentiment_agent` | Emotional read | Score frustration / urgency / churn_risk / polite; cite the phrases that drove each score | LLM; parallel co-input to response (no routing of its own) |
-| `response_agent` | Knowledge-grounded answer + draft | Retrieve the answer from the KB (cite sources; no source ⇒ confidence ≤ 0.4); draft the tone-aware reply in one pass | LLM (support_kb RAG); fan-in waits for intake (+ sentiment); routes to QA (conf ≥ 0.7) or tier-2 (< 0.7) |
+| `case_coordinator_agent` | Case coordinator (single point of contact) | Own each ticket end-to-end: open the case, record arrival channel + time, orchestrate the pod, keep live status, answer "where is my ticket?" | LLM; listens on the `support_events` stream (once enabled — see Configuration); opens cases → intake; routes exceptions → queue_manager, security/legal → SME (never triages/drafts/sends itself) |
+| `ticket_intake_agent` | Front door for every channel (incl. voice) | Normalise any channel payload → canonical Ticket; classify intent / priority / specialist; scan hard-escalation keywords; route voice calls (human / callback / self-serve; fail-closed on no transcript) | LLM (intent_taxonomy KB); fans out to sentiment; routes to response / queue_manager (escalation or cancel) / tier-1 (voice) |
+| `sentiment_agent` | Emotional read | Score frustration / urgency / churn_risk / polite; cite the phrases that drove each score | LLM; runs in parallel with triage; no routing of its own (its scores stay in the session — it has no edge to response) |
+| `response_agent` | Knowledge-grounded answer + draft | Retrieve the answer from the KB (cite sources; no source ⇒ confidence ≤ 0.4); draft the tone-aware reply in one pass | LLM (support_kb RAG); fan-in waits for intake and for sentiment to finish; routes to QA (conf ≥ 0.7) or tier-2 (< 0.7) |
 | `qa_agent` | Pre-send safety gate | Check accuracy vs cited sources + tone; exhaustive PII sweep; policy-word probe; block on any PII/policy hit; bounded QA-rework back-edge to response (exhaustion → queue_manager) | LLM; routes approved or flagged drafts to tier-1 |
-| `backlog_triage_agent` | Bulk triage drainer | Drain the queued-ticket backlog: N parallel copies each atomically CLAIM a disjoint batch (never duplicate work), triage each, escalate the worthy ones | LLM (`instances: 3`, atomic `claim_ticket_batch`); scheduled sweep in the business timezone; routes escalations → queue_manager, drain counts → audit |
-| `tier_1_agent_human` | Tier-1 operator | Review + approve the reply; escalate when needed | Human (channel-native HITL); approve → reply_dispatcher; default-deny fallback → tier-2 |
-| `reply_dispatcher_agent` | Egress actuator | SEND the approved reply on the channel it arrived on (in-thread; batched when async/email), log it to the ticket; fail-closed on unapproved / unresolved PII | Programmatic (COMMS_DISPATCH_WEBHOOK_URL; Slack/email/CPaaS), dev-store outbox fallback; terminus → audit |
-| `tier_2_specialist_human` | Tier-2 specialist | Billing / security / account depth; escalate to SME | Human; fallback → SME |
-| `sme_human` | Tier-3 SME | Engineering / security / legal escalations | Human; fallback → halt |
-| `queue_manager_human` | Queue owner | Own escalations, cancel-intent retention, SLA breaches, the legal/breach gate | Human; fallback → halt (default-deny) |
+| `backlog_triage_agent` | Bulk triage drainer | Drain the queued-ticket backlog: N parallel copies each atomically CLAIM a disjoint batch (never duplicate work), triage each, escalate the worthy ones | LLM (`scaling.copies.count: 3`, atomic `claim_ticket_batch`); scheduled sweep in the business timezone; routes escalations → queue_manager, drain counts → audit |
+| `tier_1_agent_human` | Tier-1 support agent | Review + approve the reply (30-minute window) | Human (Inbox); approve / send / edit_and_send → reply_dispatcher; hold or any other reply → audit; no answer in 30 min → card closes, nothing sent |
+| `reply_dispatcher_agent` | Egress actuator | SEND the approved reply on the channel it arrived on (in-thread; batched when async/email), log it to the ticket; fail-closed on unapproved / unresolved PII | Programmatic (n8n via vault connection `comms_dispatch_n8n`; Slack/email/CPaaS), dev-store outbox fallback; terminus → audit |
+| `tier_2_specialist_human` | Tier-2 specialist | Billing / security / account depth when the KB had no confident answer (2-hour window) | Human; approve / edit_and_send → reply_dispatcher; hold or any other reply → audit; no answer in 2h → card closes, nothing sent |
+| `sme_human` | Tier-3 SME | Engineering / security / legal matters the coordinator routes (4-hour window) | Human; every reply → audit; no answer in 4h → card closes |
+| `queue_manager_human` | Queue manager | Own escalations, cancel-intent retention, QA rework limit, thread merges, KB article review, the legal/breach gate; receives the Manager's error alerts (1-hour window) | Human; every reply → audit; no answer in 1h → card closes |
 | `support_audit_logger_agent` | WORM audit | Hash-chain every reply sent + every escalation | External (custom sink); terminus |
 | `sla_watchdog_agent` | SLA monitor | Find tickets past SLA in your support desk | Programmatic (n8n connector); cron when wired |
 | `kb_gap_filler_agent` | Knowledge-debt closer | Draft the missing KB article from the resolution path | LLM (kb_style_guide KB); routes draft to queue_manager review |
 | `support_insights_agent` | Insights analyst | CSAT/NPS rollups + trending/spiking ticket clusters | Programmatic (n8n); modes csat_ingest / cluster_ingest / report; spike → kb_gap_filler |
 | `cross_channel_agent` | Identity unifier | Resolve the customer across channels; flag thread merges | Programmatic (n8n, CRM identity); routes to response or queue_manager |
 | `crm_case_generator_agent` | Case writer | Draft the categorised, push-ready CRM case at resolution | LLM (crm_taxonomy KB); routes to insights |
+
+`backlog_triage_agent` runs a fixed 3 copies (`scaling.copies: {mode: fixed, count: 3, handoff: last}`) that split the backlog through `claim_ticket_batch`. leafmesh 2.4.484's `copies.mode: auto` with `claim_tool:` could replace that manual split; that is an owner decision and is not done here.
 
 > **Egress (now real):** `reply_dispatcher_agent` is the one connector
 > actor that finishes the job — channel chosen at runtime
@@ -92,7 +96,14 @@ direct calls.
   Python: never dispatch a reply that wasn't approved or that still has
   unresolved PII/policy — blocked dispatches record nothing and route to
   audit as a non-send
-- **HITL fallback chain** — tier_1 → tier_2 → sme → queue_manager → halt
+- **Silence never sends** — on leafmesh 2.4.486, a review nobody answers in
+  time closes its Inbox card and the ticket records that no reply came.
+  Nothing is sent, and nobody is chased automatically: there is no
+  tier-1 → tier-2 hand-off on silence. Which tier a ticket reaches is decided
+  up front by the routing (confidence, keywords, intent). Each seat still
+  declares `fallback_response: held_for_review` (→ audit) as the intended
+  timeout answer. The Manager raises only errors (hard errors, repeated agent
+  failures) to the queue manager.
 - **Enterprise state stays enterprise** — CSAT/SLA/identity are read
   from Zendesk/Intercom + Salesforce/Segment via n8n connectors; the
   template keeps no shadow SQLite ledgers
@@ -111,19 +122,34 @@ connectors use dev stand-ins that **announce themselves** until you wire Tiers 2
 | `OPENAI_API_KEY` | Coordinator + intake + QA + backlog + Manager (`gpt-4o-mini`) | **Required.** |
 | `ANTHROPIC_API_KEY` | response_agent (Claude) | **Required** unless you change the model. |
 | `REDIS_HOST` / `PORT` / `PASSWORD` | State store | Defaults to `localhost:6379`. `docker run -d -p 6379:6379 redis:7-alpine`. |
-| `SUPPORT_EVENTS_REDIS_URL` | Async inbound stream the Coordinator listens on | Defaults to local Redis. |
+| *(vault connection `support_events`)* | Async inbound stream the Coordinator listens on | Off on day 0: create the connection (its URL), then uncomment the broker and `listen_events` — in `configs/config.yaml` before the first start, in Studio's YAML editor after it (see *Changing the configuration after the first start*). |
 
-### Tier 2 — real connectors (set the URL to go live; inert until then)
-| Setting | Enables |
+### Tier 2 — real connectors (vault connections; inert until wired)
+Addresses and tokens live **only in the vault** — a URL or token written in
+`configs/config.yaml` is refused at load. Create each connection, then
+uncomment the block that names it — in `configs/config.yaml` before the first
+start, in Studio's YAML editor (or `PUT /api/yaml/raw`) after it; it applies
+without a restart:
+
+| Vault connection | Enables |
 |---|---|
-| `DOCS_MCP_URL` / `_TOKEN` | Real docs/KB retrieval for response_agent (uncomment its `mcp` block) |
-| `COMMS_DISPATCH_WEBHOOK_URL` | The egress send — Slack postMessage / email gateway / CPaaS (Twilio/EmailBison) |
-| `N8N_SUPPORT_INSIGHTS_WEBHOOK_URL` | CSAT/NPS rollups + trending/spiking clusters |
-| `N8N_SLA_WATCHDOG_WEBHOOK_URL` | Tickets-past-SLA scan |
-| `N8N_CROSS_CHANNEL_WEBHOOK_URL` | Cross-channel identity resolution |
+| `docs_mcp` (Infrastructure → Integrations → MCP: the server's URL + token) | Real docs/KB retrieval for response_agent (its `mcp` block) |
+| `comms_dispatch_n8n` (Infrastructure → Integrations → n8n, or an "Add custom" record with service type Tools: base URL = the workflow's webhook URL) | The egress send — Slack postMessage / email gateway / CPaaS (Twilio/EmailBison). Then uncomment `integration` + `connector_config` on `reply_dispatcher_agent` (they ship commented: an n8n agent with no address fails every call and is quarantined after 5) |
+| `support_insights_n8n` (same shape) | CSAT/NPS rollups + trending/spiking clusters |
+| `sla_watchdog_n8n` (same shape) | Tickets-past-SLA scan |
+| `cross_channel_n8n` (same shape) | Cross-channel identity resolution |
 
-> ⚠️ The SDK rejects an `mcp` block with an **empty** URL at load, so the block
-> ships **commented** in `configs/config.yaml`. Fill the URL, then uncomment.
+> Create the connection **before** you uncomment its block: an agent whose
+> named connection does not exist is switched off (with the reason) and works
+> as soon as the connection exists — no restart.
+> The day-0 `search_kb` tool checks whether the `docs_mcp` record exists, only
+> to word an empty KB answer. Nothing in `.env` switches it.
+
+### Manager escalation surfaces (optional)
+| Setting | For | Notes |
+|---|---|---|
+| *(vault connection `escalation_webhook`)* | PagerDuty-style webhook target | Create it (an "Add custom" record on the Infrastructure page, service type 'Outbound webhook'), then uncomment the webhook target in `manager.escalation`. |
+| `SLACK_SUPPORT_CHANNEL` + a Slack adapter | Slack escalation target | Shipped commented. Posting needs a Slack channel adapter: connect Slack on a human seat (a vault Slack record — Infrastructure → Messaging → Slack), set the channel id in `.env`, then uncomment the target. |
 
 ### Tier 3 — CRM push at resolution (later)
 `crm_case_generator_agent` drafts the push-ready CRM case; wire it to
@@ -137,3 +163,33 @@ pip install -r requirements.txt          # core LeafMesh runs the pod day-0
 docker run -d -p 6379:6379 redis:7-alpine
 python main.py
 ```
+
+## Changing the configuration after the first start
+
+`configs/config.yaml` is only the first-start seed. On the first start (an empty store) the agency imports it as version 1 and from then on keeps its configuration in the store. After that the file is not read again: an edit to it is **not** applied, even after a restart (the boot log says "that edit was NOT applied").
+
+To change a running agency:
+
+- **Studio** — its settings pages, or the raw YAML editor.
+- **API** — `PUT /api/yaml/raw` with an `X-API-Key` header and the body `{"yaml_content": "<the whole YAML>", "save_to_disk": true}`, or `PATCH /api/yaml/config` with `{"updates": {...}, "save_to_disk": true}`.
+
+Each save is a new version and applies live on every pod — no restart. (A few settings, such as brokers, make the agency reload itself in place within seconds.) So wherever this README or a comment says "uncomment X in `configs/config.yaml`", do it in the file before the first start, or in Studio's YAML editor after it.
+
+## Where the data store is set
+
+From leafmesh 2.4.482 the store (Redis or Postgres) is set **only in `.env`** — never in `configs/config.yaml`. A `persistence:` block in the YAML is ignored with a warning on leafmesh 2.4.482–2.4.485; from 2.4.486 the agency refuses to start if that block differs from `.env`, and names each `.env` line to add. The project's `.env` sets the store explicitly (`LEAFMESH_STORE`, `LEAFMESH_AGENCY_NAME`, `REDIS_*`).
+
+- Redis (default): `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_DB`; optional `REDIS_DEFAULT_TTL`, `REDIS_SESSION_TTL`, `REDIS_SSL*`, `REDIS_CLUSTER_NODES`.
+- Postgres instead: `LEAFMESH_STORE=postgres` plus `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` (optional `POSTGRES_SSLMODE`).
+- Or the whole server in one value: `REDIS_URL=redis://user:pw@host:6379/0` (`rediss://` turns TLS on) or `DATABASE_URL=postgresql://user:pw@host:5432/db`. The single names fill in what the URL leaves out.
+- With Docker Compose the app reaches Redis as `redis` (the service name); compose sets that for you.
+- Check it in Studio → **Infrastructure → Datastores**: it shows whether the store is reachable (never the address or password).
+
+## Your vault key — back it up
+
+`create-leafmesh` put a `LEAFMESH_VAULT_KEY` in your `.env` when it made this project. It is the master key that encrypts every connection and credential you store in the vault (in Redis / Postgres).
+
+- **Back it up like a master password.** Lose it and every stored connection has to be entered again.
+- **Never change or regenerate it** for an existing project — a new key locks the existing vault. To change it, use `leafmesh vault rotate-key`.
+- Every copy of the app (every replica) must get the **same** value. Docker Compose passes it in from `.env` as an environment variable.
+- Never commit `.env` (it is already in `.gitignore`).

@@ -7,9 +7,10 @@
 # hash-chained WORM audit as the terminus.
 #
 # The pod is a TEAM, not a pipeline. Every wire is conditional; every hand-off
-# is a finished contract; every human gate default-denies on silence (held ->
-# audit); the finisher SENDS the real reply and fails closed; the WORM sink is
-# the terminus. Systems (Zendesk / Slack / Twilio / Salesforce) are TOOLS or
+# is a finished contract; nothing is sent on silence (a review nobody answers
+# closes its Inbox card and the ticket records that no reply came); the
+# finisher SENDS the real reply and fails closed; the WORM sink is the
+# terminus. Systems (Zendesk / Slack / Twilio / Salesforce) are TOOLS or
 # connector actors reached by agents — never mesh members, and the customer is
 # never a member.
 #
@@ -23,24 +24,13 @@ environment: "development"
 debug: true
 log_level: "INFO"
 
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    db: 0
-    password: "${REDIS_PASSWORD:}"
-    auto_storage: true
-    decode_responses: true
-    default_ttl: 86400
-    session_ttl: 604800
-
 # 2.4.131 runtime block — the ONE non-default this pod genuinely needs: the
 # KB-grounded response super-agent can plan/retrieve/verify over many sources
 # and run long. The 2.4.131 default dropped 300s -> 90s; raise it back. (The
 # `timeouts` block is REJECTED by <=2.4.130, so it must land WITH the 2.4.131
 # floor, never before.)
 timeouts:
+  mesh_call_default_timeout_s: 120
   llm_hard_timeout_s: 300
 
 # ═══════════════════════════════════════════════════════════════════
@@ -51,11 +41,15 @@ timeouts:
 # coordinator listens and opens a case per event. DEV: a Redis stream
 # (same Redis, no extra dependency). PROD: swap to Kafka/SQS.
 # ═══════════════════════════════════════════════════════════════════
-brokers:
-  support_events:
-    type: "redis_streams"
-    url: "${SUPPORT_EVENTS_REDIS_URL:redis://localhost:6379}"
-    db: 1
+# brokers:
+  # Day 0 this broker is off: create the vault connection 'support_events' on
+  # Infrastructure → Brokers & queues → Redis Streams, then uncomment it and
+  # its agents' listen_events — here before the first start, in Studio's YAML
+  # editor after it (applies live, no restart).
+  # support_events:
+    # type: "redis_streams"
+    # connection: support_events   # vault connection (Infrastructure → Brokers & queues → Redis Streams) holds the address
+    # db: 1
   # PROD — channel webhooks -> SQS:
   # support_events:
   #   type: "sqs"
@@ -72,9 +66,10 @@ auto_discover:
   recursive: false
 
 # ═══════════════════════════════════════════════════════════════════
-# MANAGER — the SUPERVISOR. It watches every hand-off and escalates stalls /
-# contract violations / repeated errors to the Queue Manager (and pages).
-# It is not a router in the middle of the team.
+# MANAGER — the SUPERVISOR. It raises hard errors and repeated agent failures
+# to the Queue Manager and alerts on contract violations. It does not chase a
+# reviewer who has not answered, and it is not a router in the middle of the
+# team.
 # ═══════════════════════════════════════════════════════════════════
 manager:
   model: "gpt-4o-mini"
@@ -94,7 +89,6 @@ manager:
       - a ticket loops on QA rework past its bound (Response fails QA twice)
       - any ticket mentions cancel / refund / legal / regulator / breach / harm
       - Response's KB retrieval confidence < 0.7 — never let the bot guess
-      - a human review gate times out (silence must never advance a reply)
       - any agent hands off a malformed artifact
 
     Watch for: knowledge gaps (questions with no KB hit) — flag for a drafted
@@ -117,32 +111,34 @@ manager:
     targets:
       - type: "human_agent"
         agent: "queue_manager_human"
-      - type: "webhook"
-        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
-        method: "POST"
-        headers:
-          Content-Type: "application/json"
-        payload_template:
-          incident_id: "{{ticket_id}}"
-          severity: "{{severity}}"
-          message: "{{message}}"
-          session_id: "{{session_id}}"
-      - type: "channel"
-        provider: "slack"
-        channel_id: "${SLACK_SUPPORT_CHANNEL:}"
-        message_template: "[support] {{message}} — ticket {{ticket_id}} (session {{session_id}})"
+      # Webhook escalation (e.g. PagerDuty): create the vault connection
+      # 'escalation_webhook' (an "Add custom" record on the Infrastructure
+      # page, service type 'Outbound webhook'), then uncomment — here before the
+      # first start, in Studio's YAML editor after it (applies live).
+      # - type: "webhook"
+        # connection: escalation_webhook   # vault connection holds the URL + headers
+        # method: "POST"
+        # payload_template:
+          # incident_id: "{{ticket_id}}"
+          # severity: "{{severity}}"
+          # message: "{{message}}"
+          # session_id: "{{session_id}}"
+      # Slack: the channel id is set in .env (SLACK_SUPPORT_CHANNEL); posting
+      # needs a Slack channel adapter — connect Slack on a human seat (channels:
+      # {slack: {connection: <vault Slack record>}}, Infrastructure → Messaging →
+      # Slack), then uncomment. Left live with no adapter it only logs an error.
+      # - type: "channel"
+        # provider: "slack"
+        # channel_id: "${SLACK_SUPPORT_CHANNEL:}"
+        # message_template: "[support] {{message}} — ticket {{ticket_id}} (session {{session_id}})"
 
     auto_escalate:
       max_retries: 2
       max_errors_per_session: 3
-      timeout_threshold: 2
 
   health_check_interval: 60
   agent_timeout_threshold: 300
   chain_completion_timeout: 600
-
-mesh:
-  call_timeout: 120
 
 # ═══════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -290,10 +286,10 @@ agents:
     # Hear inbound messages live off the async stream, in addition to the
     # per-channel entry points. A channel-webhook receiver writes each message
     # onto support_events; the Coordinator wakes per event and opens a case.
-    listen_events:
-      - broker: "support_events"
-        stream: "support:inbound"
-        consumer_group: "support-coordinator"
+    # listen_events:
+      # - broker: "support_events"
+        # stream: "support:inbound"
+        # consumer_group: "support-coordinator"
 
     prompt: |
       You are the Case Coordinator. You OWN each support ticket from the moment
@@ -476,7 +472,7 @@ agents:
       channel: "string"
       channel_thread_id: "string"
       raw_message: "string"
-      attachments: "list"
+      attachments: {type: array, items: string}   # attachment refs
       account_tier: "string"
       raw_payload: "object"
       # Responsibility 2 — triage classification
@@ -484,7 +480,7 @@ agents:
       priority: "string"
       requires_specialist: "boolean"
       specialist_topic: "string"
-      escalation_keywords: "list"
+      escalation_keywords: {type: array, items: string}
       routing_briefing: "string"
       escalation_reason: "string"
       # Responsibility 3 — voice-call routing (vacuous in ticket mode)
@@ -586,7 +582,7 @@ agents:
       urgency: "number"
       polite: "boolean"
       churn_risk: "number"
-      cited_phrases: "list"
+      cited_phrases: {type: array, items: string}
 
     inputs:
       upstream_yields: "object"
@@ -701,7 +697,7 @@ agents:
 
     yields:
       answer_outline: "string"
-      cited_sources: "list"
+      cited_sources: {type: array, items: string}   # source ids / URLs
       confidence: "number"              # 0..1 retrieval confidence
       knowledge_gap: "boolean"          # true if no good source found
       reply_body: "string"
@@ -718,15 +714,17 @@ agents:
         Never invent product features or commitments. If the customer asks about
         a feature not in the KB, route to feature_request intent — don't promise.
 
-    # ── To wire a real docs/KB MCP server, uncomment and set the URL (each named
-    #    action under `use:` joins this agent's tool list, namespaced
-    #    <server>_<tool>). NOTE: the SDK rejects an http mcp block with an EMPTY
-    #    url at load, so this ships COMMENTED — fill the URL, then uncomment. The
-    #    day-0 search_kb / read_past_tickets dev tools are the fallback contract. ──
+    # ── To wire a real docs/KB MCP server: create the vault connection
+    #    'docs_mcp' (the server's URL + token — Infrastructure → Integrations →
+    #    MCP, or an "Add custom" record with service type Tools), then uncomment
+    #    (here before the first start, in Studio's YAML editor after it)
+    #    (each named action under `use:` joins this agent's tool list,
+    #    namespaced <server>_<tool>). A URL or token written here is refused at
+    #    load. The day-0 search_kb / read_past_tickets dev tools are the
+    #    fallback contract. ──
     # mcp:
-    #   - transport: http
-    #     url: "${DOCS_MCP_URL}"
-    #     token: "${DOCS_MCP_TOKEN:}"
+    #   - connection: docs_mcp
+    #     transport: http
     #     use: [search_docs, fetch_article]
     #     name: docs
     #     timeout: 30
@@ -790,10 +788,10 @@ agents:
 
     yields:
       approved: "boolean"
-      issues: "list"
+      issues: {type: array, items: string}
       tone_acceptable: "boolean"
-      pii_concerns: "list"
-      policy_concerns: "list"
+      pii_concerns: {type: array, items: string}      # "email:<addr>", "account_id:<v>"
+      policy_concerns: {type: array, items: string}   # "policy_word:<word>"
       ticket_id: "string"               # identity passthrough — Tier-1 reviews THIS ticket
       reply_body: "string"
       revision_round: "number"          # bounded back-edge counter
@@ -821,7 +819,7 @@ agents:
 
   # ─────────────────────────────────────────────────────────────────────────
   # Backlog Triage — Bulk Triage Drainer (AI, N parallel copies). Drains the
-  # queued-ticket backlog: each of the `instances` copies atomically CLAIMS a
+  # queued-ticket backlog: each of the scaling.copies.count copies atomically CLAIMS a
   # disjoint batch (claim_ticket_batch) so copies never duplicate work, triages
   # them, and hands escalation-worthy tickets to the Queue Manager. Distinct
   # from real-time Intake (which is the per-ticket front door). Scheduled sweep
@@ -837,12 +835,15 @@ agents:
     max_tool_calls_per_message: 10
     description: "Bulk triage drainer — parallel copies each claim a disjoint backlog batch and triage it."
 
-    instances: 3                          # 3 parallel copies per activation
-    instances_handoff: last               # COMBINE: counts sum, lists concat, route once
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 3                          # 3 parallel copies per activation
+        handoff: last               # COMBINE: counts sum, lists concat, route once
 
     # Scheduled sweep — daily at 08:00 in the business timezone (NOT UTC). Also
     # reachable via the backlog_sweep entry point. One cron line is all a fanned
-    # agent needs (a multi-entry wake_up would multiply by instances).
+    # agent needs (a multi-entry wake_up would multiply by copies.count).
     wake_up: "0 8 * * *"
     timezone: "America/New_York"
     wake_up_input:
@@ -852,9 +853,13 @@ agents:
       You are draining the queued-ticket backlog. Call claim_ticket_batch to
       atomically claim YOUR batch of backlog tickets — the claim guarantees your
       copy and the other copies get DISJOINT tickets, so you never duplicate work.
-      Triage each claimed ticket exactly as the front door would: intent,
-      priority, and whether it needs escalation. Collect the ticket_ids you
-      escalate. Report honest counts — do not invent tickets you did not claim.
+      The claim returns each ticket's content (`tickets`: channel, customer,
+      subject, message). Triage each claimed ticket exactly as the front door
+      would: intent, priority, and whether it needs escalation (the same
+      hard-escalation words: legal, GDPR, breach, regulator, harm, …; and an
+      outage or a cancel). A ticket with no message text is escalated, not
+      guessed at. Collect the ticket_ids you escalate. Report honest counts —
+      do not invent tickets you did not claim.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
 
@@ -866,9 +871,9 @@ agents:
     tools: ["claim_ticket_batch"]
 
     yields:
-      claimed_ticket_ids: "list"
+      claimed_ticket_ids: {type: array, items: string}
       triaged_count: "number"
-      escalations: "list"
+      escalations: {type: array, items: string}       # ticket_ids escalated
       backlog_remaining: "number"
       summary: "string"
 
@@ -901,10 +906,26 @@ agents:
     name: "reply_dispatcher_agent"
     agent_type: "programmatic"
     communication_type: "chain"
-    integration: "n8n"
     description: "Egress actuator / finisher — SENDS the approved reply on its arrival channel (in-thread, batched when async), renders the artifact, fail-closed on unapproved / PII."
-    connector_config:
-      webhook_url: "${COMMS_DISPATCH_WEBHOOK_URL:}"
+    # The comms platform that SENDS the approved reply (Slack postMessage /
+    # email gateway / CPaaS) behind an n8n workflow. Day 0 it is not wired:
+    # the Python records each approved send in the dev outbox and renders it.
+    # The connector lines ship commented on purpose: an n8n agent with no
+    # workflow address fails every call, and after 5 failures in a row the
+    # SDK quarantines it (its Python stops running until someone releases it).
+    # To wire it: create the vault connection 'comms_dispatch_n8n'
+    # (Infrastructure → Integrations → n8n, or an "Add custom" record with
+    # service type Tools: base URL = the workflow's webhook URL, secret = its
+    # auth token), then uncomment the three lines below (in configs/config.yaml
+    # before the first start, in Studio's YAML editor after it). Your workflow
+    # receives the approved reply in `reply_body`, or the person's corrected
+    # text (`edited_reply`, in the reply's human_data) when the decision is
+    # edit_and_send — send that one.
+    # The n8n call runs before this agent's Python floor, so the workflow must
+    # send only when `human_message` is an approval word.
+    # integration: "n8n"
+    # connector_config:
+    #   connection: comms_dispatch_n8n
 
     yields:
       dispatch_id: "string"
@@ -936,11 +957,13 @@ agents:
 
   # ─────────────────────────────────────────────────────────────────────────
   # Human members — first-class, reached in the inbox they already live in.
-  # Every gate DEFAULT-DENIES on timeout (fallback -> held_for_review -> audit).
-  # `dual` belongs on the human boundary agents; they only ever call chain /
-  # execute agents (never another dual human), so there is no dual->dual
-  # ping-pong. Tier escalation between humans is handled by the Manager
-  # supervisor, not by hardcoded human->human wires.
+  # Nothing is sent on silence: on leafmesh 2.4.486 a review nobody answers in
+  # time closes its Inbox card and the ticket records that no reply came. Each
+  # seat still declares fallback_response: held_for_review (-> audit) as the
+  # intended timeout answer. `dual` belongs on the human boundary agents; they
+  # only ever call chain agents (never another dual human), so there is no
+  # dual->dual ping-pong. Which tier a ticket reaches is decided by the routing
+  # (confidence, keywords, intent) — nobody is chased automatically.
   # ─────────────────────────────────────────────────────────────────────────
   tier_1_agent_human:
     name: "tier_1_agent_human"
@@ -959,7 +982,8 @@ agents:
       human_message: held_for_review
 
     yields:
-      decision: "string"                # sent | edit_and_send | held_for_review
+      decision: "string"                # approve | edit_and_send | hold
+      edited_reply: "string"            # with edit_and_send: the full text to send instead
       sent_at_utc: "string"
 
     inputs:
@@ -968,15 +992,25 @@ agents:
       channel: "string"
       channel_thread_id: "string"
 
+    human_prompt_template: |
+      QA-cleared reply for this ticket. Read it against the customer's message.
+      Reply 'approve' (or 'send') to SEND it on the channel it arrived on,
+      'edit_and_send' with your corrected text in edited_reply, or 'hold' to
+      keep it back. Any other reply is recorded and nothing is sent.
+      If nobody answers within 30 minutes, the request waits no longer: its
+      Inbox card closes and the ticket records that no reply came. Nothing is
+      sent on silence.
+
     can_call:
       # APPROVED -> the finisher that actually sends. Approval is not delivery:
       # Tier-1 signs off, reply_dispatcher_agent FINISHES the job. Its fail-closed
-      # floor re-checks approval + PII before it sends.
+      # floor re-checks approval + PII before it sends. The tokens match the
+      # dispatcher's allow-list exactly.
       - agent: "reply_dispatcher_agent"
-        condition: "calling_agent_response.human_message == 'sent' or calling_agent_response.human_message == 'edit_and_send' or calling_agent_response.human_message == 'approved'"
-      # Held on silence / hold -> audit; the Manager escalates the tier.
+        condition: "calling_agent_response.human_message == 'sent' or calling_agent_response.human_message == 'send' or calling_agent_response.human_message == 'edit_and_send' or calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'approved'"
+      # Hold / held_for_review / any other reply -> audit (recorded, not sent).
       - agent: "support_audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message != 'sent' and calling_agent_response.human_message != 'send' and calling_agent_response.human_message != 'edit_and_send' and calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'approved'"
 
   tier_2_specialist_human:
     name: "tier_2_specialist_human"
@@ -993,18 +1027,29 @@ agents:
 
     yields:
       decision: "string"
+      edited_reply: "string"            # with edit_and_send: the full text to send instead
       notes: "string"
 
     inputs:
       ticket_id: "string"
+      reply_body: "string"
+
+    human_prompt_template: |
+      The knowledge base had no confident answer for this ticket (confidence
+      below 0.7). Write or fix the reply: answer 'edit_and_send' with your text
+      in edited_reply, or 'approve' to SEND the draft as it is, or 'hold' to keep it back. Any other reply is
+      recorded and nothing is sent. Engineering, security or legal matters
+      belong with the SME: say so in your hold note.
+      If nobody answers within 2 hours, the request waits no longer: its Inbox
+      card closes and the ticket records that no reply came.
 
     can_call:
       # A specialist-resolved reply can also go to the finisher to send.
       - agent: "reply_dispatcher_agent"
-        condition: "calling_agent_response.human_message == 'sent' or calling_agent_response.human_message == 'edit_and_send' or calling_agent_response.human_message == 'approved'"
-      # Held / unresolved -> audit; the Manager escalates to the SME.
+        condition: "calling_agent_response.human_message == 'sent' or calling_agent_response.human_message == 'send' or calling_agent_response.human_message == 'edit_and_send' or calling_agent_response.human_message == 'approve' or calling_agent_response.human_message == 'approved'"
+      # Hold / any other reply -> audit (recorded, not sent).
       - agent: "support_audit_logger_agent"
-        condition: "calling_agent_response.human_message == 'held_for_review'"
+        condition: "calling_agent_response.human_message != 'sent' and calling_agent_response.human_message != 'send' and calling_agent_response.human_message != 'edit_and_send' and calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'approved'"
 
   sme_human:
     name: "sme_human"
@@ -1026,6 +1071,13 @@ agents:
     inputs:
       ticket_id: "string"
       specialist_topic: "string"
+
+    human_prompt_template: |
+      Engineering / security / legal matter routed to you. Record your decision
+      and notes. Every reply is recorded to the audit log; nothing is sent to
+      the customer from here.
+      If nobody answers within 4 hours, the request waits no longer: its Inbox
+      card closes and the ticket records that no reply came.
 
     can_call:
       # Terminus — every SME decision (and a held gate) is recorded.
@@ -1052,6 +1104,14 @@ agents:
       ticket_id: "string"
       escalation_reason: "string"
 
+    human_prompt_template: |
+      Escalated ticket (hard-escalation keyword, cancel intent, QA rework limit,
+      thread merge, or a drafted KB article for review). Record your decision
+      and directive. Every reply is recorded to the audit log; nothing is sent
+      to the customer from here.
+      If nobody answers within 1 hour, the request waits no longer: its Inbox
+      card closes and the ticket records that no reply came.
+
     can_call:
       # Terminus — every escalation decision (and a held gate) is recorded.
       - agent: "support_audit_logger_agent"
@@ -1064,7 +1124,7 @@ agents:
     name: "support_audit_logger_agent"
     agent_type: "external"
     framework: "custom"
-    communication_type: "execute"
+    communication_type: "chain"
     description: "WORM audit — hash-chains every reply sent, escalation, and held gate. Terminus."
     connector_config:
       sink_type: "local_file"
@@ -1126,9 +1186,9 @@ agents:
     yields:
       article_title: "string"
       problem_statement: "string"
-      resolution_steps: "list"
-      prerequisites: "list"
-      related_articles: "list"
+      resolution_steps: {type: array, items: string}
+      prerequisites: {type: array, items: string}
+      related_articles: {type: array, items: string}
       suggested_kb_section: "string"
       confidence: "number"
 
@@ -1207,7 +1267,7 @@ agents:
       subcategory: "string"
       product_feature: "string"
       sentiment_trajectory: "string"
-      kb_articles_cited: "list"
+      kb_articles_cited: {type: array, items: string}
       resolution_summary: "string"
       time_to_resolve_minutes: "number"
       csat_score: "number"
@@ -1231,7 +1291,7 @@ agents:
   # Connector actors — systems reached as boundary agents, NOT mesh members.
   # CSAT / SLA / cross-channel identity live in YOUR support desk + CRM (Zendesk
   # Explore, Zendesk SLA policies, Salesforce/Segment) behind n8n workflows that
-  # return each agent's yields shape. Inert until the webhook URL is set.
+  # return each agent's yields shape. Inert until its vault connection is wired.
   # ─────────────────────────────────────────────────────────────────────────
   support_insights_agent:
     name: "support_insights_agent"
@@ -1239,8 +1299,15 @@ agents:
     communication_type: "chain"
     integration: "n8n"
     description: "Support insights analyst — CSAT/NPS rollups AND trending/spiking clusters, read via n8n. Modes: csat_ingest | cluster_ingest | report."
+    # CSAT/NPS rollups + cluster trends from your support desk's analytics. Day 0 the record does not exist yet. To wire it: create the vault
+    # connection 'support_insights_n8n' (Infrastructure → Integrations → n8n, or an "Add custom"
+    # record with service type Tools: base URL = the workflow's webhook
+    # URL, secret = its auth token), until it exists the SDK switches this
+    # agent off with a notice (it is never called without an address); it
+    # switches on, with no restart, once the record exists. A
+    # webhook URL or token written here is refused at load.
     connector_config:
-      webhook_url: "${N8N_SUPPORT_INSIGHTS_WEBHOOK_URL:}"
+      connection: support_insights_n8n
     yields:
       mode: "string"
       customer_id: "string"
@@ -1281,8 +1348,15 @@ agents:
     communication_type: "chain"
     integration: "n8n"
     description: "Unifies customer threads across email, Slack, Zendesk, WhatsApp — identity resolved in your CRM (Salesforce / Segment) via n8n."
+    # Cross-channel identity resolution in your CRM. Day 0 the record does not exist yet. To wire it: create the vault
+    # connection 'cross_channel_n8n' (Infrastructure → Integrations → n8n, or an "Add custom"
+    # record with service type Tools: base URL = the workflow's webhook
+    # URL, secret = its auth token), until it exists the SDK switches this
+    # agent off with a notice (it is never called without an address); it
+    # switches on, with no restart, once the record exists. A
+    # webhook URL or token written here is refused at load.
     connector_config:
-      webhook_url: "${N8N_CROSS_CHANNEL_WEBHOOK_URL:}"
+      connection: cross_channel_n8n
     yields:
       customer_key: "string"
       current_channel: "string"
@@ -1312,13 +1386,20 @@ agents:
   sla_watchdog_agent:
     name: "sla_watchdog_agent"
     agent_type: "programmatic"
-    communication_type: "execute"
+    communication_type: "chain"
     integration: "n8n"
     description: "Scans your support desk (Zendesk SLA policies via n8n) for tickets past SLA and reports breaches."
     # wake_up: "*/5 * * * *"   # enable AFTER wiring the Zendesk-SLA n8n connector.
     # timezone: "America/New_York"   # governs the cron above once enabled (crons run UTC otherwise).
+    # SLA breach state from your support desk. Day 0 the record does not exist yet. To wire it: create the vault
+    # connection 'sla_watchdog_n8n' (Infrastructure → Integrations → n8n, or an "Add custom"
+    # record with service type Tools: base URL = the workflow's webhook
+    # URL, secret = its auth token), until it exists the SDK switches this
+    # agent off with a notice (it is never called without an address); it
+    # switches on, with no restart, once the record exists. A
+    # webhook URL or token written here is refused at load.
     connector_config:
-      webhook_url: "${N8N_SLA_WATCHDOG_WEBHOOK_URL:}"
+      connection: sla_watchdog_n8n
     yields:
       breached_count: "number"
       breached_ticket_ids: "list"
