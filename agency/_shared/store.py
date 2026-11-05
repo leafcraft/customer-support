@@ -83,11 +83,43 @@ SEED_KB: list[dict[str, Any]] = [
      "keywords": ["export", "download data", "csv", "backup"],
      "body": "Admins can export from Workspace > Data > Export. The archive is "
              "emailed as a link that expires in 24 hours."},
+    {"id": "kb-120", "title": "Set up SAML single sign-on",
+     "section": "account", "url": "https://docs.example.com/kb-120",
+     "keywords": ["sso", "saml", "okta", "single sign-on", "identity provider"],
+     "body": "Workspace owners on the Business or Enterprise plan can enable SAML "
+             "under Settings > Security > Single sign-on. Upload your identity "
+             "provider's metadata XML, map the email attribute, then test with one "
+             "user before enforcing SSO for everyone."},
+    {"id": "kb-230", "title": "Cancel or downgrade your plan",
+     "section": "billing", "url": "https://docs.example.com/kb-230",
+     "keywords": ["cancel", "downgrade", "close account", "stop subscription"],
+     "body": "Owners can downgrade under Billing > Plan. Cancelling stops renewal "
+             "at the end of the current term; data stays readable for 30 days. "
+             "Seat reductions on annual plans apply at renewal."},
 ]
 
 # ── Seed past tickets — prior resolved tickets so response_agent can ground on
 #    precedent, and so cross-channel history has something to show. ──
 SEED_PAST_TICKETS: dict[str, list[dict[str, Any]]] = {
+    # examples/01 — this customer had a reset-email problem before.
+    "c-1f44a": [
+        {"ticket_id": "tkt-0388", "channel": "web", "intent": "account",
+         "resolution": "Reset email was caught by the customer's spam filter; "
+                       "allow-listed noreply@ and resent (kb-101).",
+         "resolved_at": "2026-03-11T15:02:00Z"},
+    ],
+    # examples/02 — "the third time this has happened": two earlier seat-count
+    # invoice errors, each settled with a credit note.
+    "c-bigco-007": [
+        {"ticket_id": "tkt-0412", "channel": "email", "intent": "billing",
+         "resolution": "January invoice billed 180 seats vs 140 active; credit "
+                       "note CN-2026-0031 issued for 40 seats.",
+         "resolved_at": "2026-02-03T11:20:00Z"},
+        {"ticket_id": "tkt-0533", "channel": "email", "intent": "billing",
+         "resolution": "March invoice billed 160 seats vs 141 active; credit "
+                       "note CN-2026-0058 issued for 19 seats.",
+         "resolved_at": "2026-04-02T09:45:00Z"},
+    ],
     "cust-1042": [
         {"ticket_id": "tkt-0001", "channel": "email", "intent": "account",
          "resolution": "Sent password-reset link (kb-101); customer confirmed access.",
@@ -103,9 +135,62 @@ SEED_PAST_TICKETS: dict[str, list[dict[str, Any]]] = {
     ],
 }
 
-# ── Seed backlog — queued ticket ids the backlog_triage copies drain. The claim
-#    is atomic so parallel copies (instances: N) get DISJOINT batches. ──
-_SEED_BACKLOG: list[str] = [f"tkt-bk-{i:03d}" for i in range(1, 25)]
+# ── Seed backlog — queued tickets the backlog_triage copies drain. The claim
+#    is atomic so parallel copies (scaling.copies.count: N) get DISJOINT batches.
+#    A mix a real overnight queue holds: routine how-tos, a billing dispute, a
+#    cancel, a legal (GDPR) request, an outage report, a duplicate of an open
+#    ticket, and one with no message text (missing data). ──
+SEED_BACKLOG_TICKETS: dict[str, dict[str, Any]] = {t["ticket_id"]: t for t in [
+    {"ticket_id": "tkt-bk-001", "channel": "email", "customer_id": "cust-1042",
+     "account_tier": "standard", "received_at_utc": "2026-11-02T22:14:00Z",
+     "subject": "Locked out after password change",
+     "message": "I changed my password and now the app says my account is locked."},
+    {"ticket_id": "tkt-bk-002", "channel": "web", "customer_id": "c-bigco-007",
+     "account_tier": "enterprise", "received_at_utc": "2026-11-02T22:40:00Z",
+     "subject": "October invoice seat count",
+     "message": "October invoice shows 200 seats; our admin console shows 151 active."},
+    {"ticket_id": "tkt-bk-003", "channel": "chat", "customer_id": "cust-2277",
+     "account_tier": "standard", "received_at_utc": "2026-11-02T23:05:00Z",
+     "subject": "How do I export last quarter?",
+     "message": "Need a CSV of all Q3 records for our auditors. Where is export?"},
+    {"ticket_id": "tkt-bk-004", "channel": "email", "customer_id": "cust-5120",
+     "account_tier": "standard", "received_at_utc": "2026-11-02T23:31:00Z",
+     "subject": "Please cancel our subscription",
+     "message": "We are moving off the product at the end of the month. Please cancel."},
+    {"ticket_id": "tkt-bk-005", "channel": "email", "customer_id": "cust-6634",
+     "account_tier": "named", "received_at_utc": "2026-11-03T00:12:00Z",
+     "subject": "GDPR erasure request",
+     "message": "Under GDPR Article 17 we request deletion of all personal data "
+                "for the user j.ortega@meridianfreight.example."},
+    {"ticket_id": "tkt-bk-006", "channel": "slack", "customer_id": "cust-3310",
+     "account_tier": "enterprise", "received_at_utc": "2026-11-03T00:47:00Z",
+     "subject": "API returning 500s",
+     "message": "Since 00:30 UTC every POST to /v2/orders returns 500. Production is down."},
+    {"ticket_id": "tkt-bk-007", "channel": "slack", "customer_id": "cust-3310",
+     "account_tier": "enterprise", "received_at_utc": "2026-11-03T00:52:00Z",
+     "subject": "Re: API returning 500s",
+     "message": "Following up on the 500s — still failing. Same issue as my last message."},
+    {"ticket_id": "tkt-bk-008", "channel": "web", "customer_id": "cust-4471",
+     "account_tier": "standard", "received_at_utc": "2026-11-03T01:20:00Z",
+     "subject": "Card declined on renewal",
+     "message": "Our renewal payment failed. I updated the card — what now?"},
+    {"ticket_id": "tkt-bk-009", "channel": "email", "customer_id": "cust-6634",
+     "account_tier": "named", "received_at_utc": "2026-11-03T02:03:00Z",
+     "subject": "SSO setup with our identity provider",
+     "message": "We want SAML SSO for 80 users. Which plan and what are the steps?"},
+    {"ticket_id": "tkt-bk-010", "channel": "chat", "customer_id": "cust-2277",
+     "account_tier": "standard", "received_at_utc": "2026-11-03T02:30:00Z",
+     "subject": "Feature idea: dark mode",
+     "message": "Would love a dark mode for the dashboard."},
+    {"ticket_id": "tkt-bk-011", "channel": "email", "customer_id": "cust-5120",
+     "account_tier": "standard", "received_at_utc": "2026-11-03T03:15:00Z",
+     "subject": "Refund for unused months",
+     "message": "We paid annually in March. Can we get a refund for the unused months?"},
+    {"ticket_id": "tkt-bk-012", "channel": "web", "customer_id": "",
+     "account_tier": "standard", "received_at_utc": "2026-11-03T03:58:00Z",
+     "subject": "(no subject)", "message": ""},
+]}
+_SEED_BACKLOG: list[str] = list(SEED_BACKLOG_TICKETS)
 
 
 # ── KB reads (dev-store fallback for the RAG / docs-MCP path) ────────────────
@@ -152,7 +237,10 @@ def claim_batch(count: int) -> dict[str, Any]:
         claimed = backlog[:n]
         remaining = backlog[n:]
         _save("backlog", remaining)
-    return {"available": True, "claimed": claimed,
+    # The ticket content travels with the ids, so a copy triages what the
+    # customer actually wrote — never an id alone.
+    tickets = [dict(SEED_BACKLOG_TICKETS.get(tid) or {"ticket_id": tid}) for tid in claimed]
+    return {"available": True, "claimed": claimed, "tickets": tickets,
             "claimed_count": len(claimed), "remaining": len(remaining)}
 
 
