@@ -1,16 +1,17 @@
 """customer-support — Customer-Support Pod (LeafMesh).
 
 Boot order matters (SDK 2.4.131):
-  1. import agency.tools  → the @global_tool decorators run BEFORE from_yaml/start,
+  1. import agency.tools  → the @global_tool decorators run BEFORE from_store/start,
      so response_agent's search_kb / read_past_tickets and backlog_triage's
      claim_ticket_batch are registered.
-  2. LeafMesh.from_yaml(...) → auto_discover wires the finisher
+  2. LeafMesh.from_store() → auto_discover wires the finisher
      agency/reply_dispatcher_agent.py to the YAML.
   3. audit_logger.register(...) → attach the WORM sink to the custom external
-     support_audit_logger_agent (after from_yaml, before start).
+     support_audit_logger_agent (after from_store, before start).
   4. leafmesh.start().
 
-YAML-FIRST: every agent is defined in configs/config.yaml; the only Python is the
+YAML-FIRST: every agent is defined in the agency's configuration (in the store;
+see Studio); the only Python is the
 finisher (reply_dispatcher_agent.py), the WORM sink (agency/_shared), and the
 day-0 dev-store tools (agency/tools.py + agency/_shared/store.py).
 """
@@ -26,7 +27,7 @@ from agency._shared import audit_logger as _audit_logger
 
 load_dotenv()
 logger = LeafMeshLogger(__name__)
-leafmesh = LeafMesh.from_yaml("configs/config.yaml")
+leafmesh = LeafMesh.from_store()
 
 # Register the WORM audit sink as the intelligence function for the
 # custom external support_audit_logger_agent (SDK 2.4+ API).
@@ -52,10 +53,8 @@ async def main():
     leafmesh.event_bus.subscribe(EventType.MANAGER_INTERVENTION,  _on_manager_intervention)
     leafmesh.event_bus.subscribe(EventType.INTERVENTION_NEEDED,   _on_intervention_needed)
     leafmesh.event_bus.subscribe(EventType.HUMAN_INPUT_TIMEOUT,   _on_human_input_timeout)
-    try:
-        await leafmesh.enable_self_healing()
-    except AttributeError:
-        pass
+    # Self-healing is automatic — the SDK enables it during start() on
+    # every operator-facing mesh. No call is needed.
 
     logger.info("customer-support — Customer Support mesh running")
     logger.info("API: http://127.0.0.1:18820/docs")
