@@ -20,8 +20,9 @@ It is the concrete "@chain fails closed" (doctrine B4), two layers deep:
   d) two-layer defense — the body short-circuits before writing; the @chain
      `enforce_send_floor` re-checks independently and deletes on a trip.
 
-Connector: COMMS_DISPATCH_WEBHOOK_URL (a comms dispatcher / CPaaS — Slack
-postMessage, your email gateway, Twilio/EmailBison). Inert until set.
+Connector: the n8n workflow behind the vault connection 'comms_dispatch_n8n'
+(a comms dispatcher / CPaaS — Slack postMessage, your email gateway,
+Twilio/EmailBison), picked in the configuration. Inert until wired.
 """
 from __future__ import annotations
 
@@ -124,6 +125,10 @@ def _block_reasons(input_data: dict[str, Any]) -> list[str]:
         reasons.append("qa did not approve")
     if not str(_pick(input_data, "reply_body", "")).strip():
         reasons.append("no reply body to send")
+    # edit_and_send means "send MY text": without it, nothing goes out (the
+    # draft the person meant to correct is never sent in its place).
+    if decision == "edit_and_send" and not str(_pick(input_data, "edited_reply", "")).strip():
+        reasons.append("edit_and_send with no edited text in edited_reply")
     return reasons
 
 
@@ -220,6 +225,10 @@ async def reply_dispatcher_agent(llm_response, input_data, context):
         channel = channel if channel != "web" else recovered.get("channel", channel)
         thread_id = thread_id or recovered.get("channel_thread_id", "")
         reply_body = recovered.get("reply_body", "")
+    # The person's corrected text replaces the draft (the floor blocks an
+    # edit_and_send that carries none).
+    if _decision(input_data) == "edit_and_send":
+        reply_body = str(_pick(input_data, "edited_reply", "")).strip() or reply_body
 
     base = {
         **_DEFAULTS,
@@ -283,5 +292,5 @@ async def reply_dispatcher_agent(llm_response, input_data, context):
         "send_status": "recorded",
         "artifact_path": artifact_path,
         "dispatch_reason": f"recorded to dev outbox ({delivery_mode}); "
-                           f"wire COMMS_DISPATCH_WEBHOOK_URL to send live",
+                           f"wire the comms_dispatch_n8n vault connection to send live",
     }
