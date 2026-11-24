@@ -97,9 +97,12 @@ def _pick(input_data: dict[str, Any], key: str, default: Any = "") -> Any:
 
 
 def _decision(input_data: dict[str, Any]) -> str:
-    """The human verdict, from wherever the SDK delivered it."""
+    """The human verdict, from wherever the SDK delivered it. Since 2.4.528
+    the seat's reply_reader puts it in `verdict`; `human_message` is then the
+    person's own words."""
     return str(
-        input_data.get("human_message")
+        input_data.get("verdict")
+        or input_data.get("human_message")
         or _pick(input_data, "decision", "")
     ).strip().lower()
 
@@ -214,7 +217,7 @@ async def reply_dispatcher_agent(llm_response, input_data, context):
     reply_body = _pick(input_data, "reply_body", "")
     delivery_mode = "batched" if channel in _BATCHED_CHANNELS else "in_thread"
 
-    # Keep the reply context recoverable across the HITL gate / a re-entry.
+    # Keep the reply context recoverable across the human step / a re-entry.
     sid = resolve_session_id(input_data, context or {})
     if reply_body and sid:
         stash_put(sid, {"ticket_id": ticket_id, "channel": channel,

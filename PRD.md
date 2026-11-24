@@ -130,7 +130,7 @@ For written/async tickets and for drafting outbound content,
 confidence) and drafts; **`qa_agent`** clears it (PII sweep + policy probe +
 tone) — a hit blocks. Low confidence / sensitive / legal routes to the right
 human: **tier-1 → tier-2 → SME**, with **queue_manager** owning escalations,
-cancel-intent, SLA, and the legal/breach gate. Humans approve; delivery is
+cancel-intent, SLA, and the legal/breach decisions. Humans approve; delivery is
 the conversation agent (live) or `bulk_comms_agent` (async) — **approval ≠
 delivery**.
 
@@ -162,10 +162,10 @@ responsibilities, and the things it can actually do. None are thin nodes.
 | `response_agent` | **Knowledge specialist — written support** | Find the grounded answer in the KB (cite sources; flag when there is no good source), draft the written reply / outbound content | LLM (support_kb RAG); routes → QA (conf ≥ 0.7) / tier-2 (< 0.7) |
 | `qa_agent` | **Quality & compliance reviewer** | Check every draft for accuracy, tone, PII and policy before it leaves; block anything unsafe | LLM; routes approved/flagged → tier-1 |
 | `reply_dispatcher_agent` (shipped) | **Egress actuator / outbound comms coordinator** | After tier-1 approves, actually SEND the reply on the channel it arrived on (in-thread; batched when the session is async/closed); log it to the ticket | Programmatic (n8n via vault connection `comms_dispatch_n8n` — Slack/email/CPaaS), dev-store outbox fallback; deterministic fail-closed floor (no send without approval + clean PII); terminus → audit |
-| `tier_1_agent_human` | **Tier-1 support agent** | Review and send replies | Human (Inbox); approve → dispatcher; hold → audit; no answer in 30 min → card closes, nothing sent |
-| `tier_2_specialist_human` | **Tier-2 specialist** | Resolve billing / security / account depth | Human; approve → dispatcher; hold → audit; no answer in 2h → card closes |
-| `sme_human` | **Subject-matter expert (Tier-3)** | Own engineering / security / legal escalations | Human; → audit; no answer in 4h → card closes |
-| `queue_manager_human` | **Support queue manager** | Own escalations, cancellations, SLA breaches and the legal/breach gate | Human; → audit; no answer in 1h → card closes |
+| `tier_1_agent_human` | **Tier-1 support agent** | Review and send replies | Human (Inbox); verdict approve / send / edit_and_send → dispatcher; hold → audit; no answer in 30 min → default `hold` → audit, nothing sent |
+| `tier_2_specialist_human` | **Tier-2 specialist** | Resolve billing / security / account depth | Human; verdict approve / send / edit_and_send → dispatcher; hold → audit; no answer in 2h → default `hold` → audit |
+| `sme_human` | **Subject-matter expert (Tier-3)** | Own engineering / security / legal escalations | Human; → audit (`answer` → the agent that asked); no answer in 4h → default `hold` → audit |
+| `queue_manager_human` | **Support queue manager** | Own escalations, cancellations, SLA breaches and the legal/breach decisions | Human; → audit (`answer` → the agent that asked); no answer in 1h → default `hold` → audit |
 | `crm_case_generator_agent` | **Case documenter** | Write up the categorised, push-ready case record at resolution | LLM (crm_taxonomy); feeds register / insights |
 | `kb_gap_filler_agent` | **Knowledge-base author** | Turn an unanswered ticket into the article that should have existed | LLM (kb_style_guide); routes draft → queue_manager review |
 | `support_insights_agent` | **Support analyst** | Report CSAT/NPS trends and spiking ticket clusters from your analytics | Connector (n8n); modes csat_ingest / cluster_ingest / report; spike → kb_gap_filler |
@@ -209,10 +209,10 @@ responsibilities, and the things it can actually do. None are thin nodes.
 - **Form-completeness gate** — nothing registers/resolves on a half-filled form.
 - **KB-grounded** answers; no-source ⇒ confidence capped ⇒ escalate.
 - **QA gate** before any outbound — PII/policy hit ⇒ blocked.
-- **Hard-escalation human gate** — legal/breach/GDPR/harm never reach the bot (edge-enforced).
+- **Hard-escalation human step** — legal/breach/GDPR/harm never reach the bot (edge-enforced).
 - **Bulk threshold** — async outreach batches; no accidental per-message spray.
-- **Nothing is sent on silence** (a review nobody answers closes its Inbox card;
-  nobody is chased automatically); **WORM audit** of every send + escalation.
+- **Nothing is sent on silence** (a review nobody answers takes its default
+  reply, `hold`, to the audit log; nobody is chased automatically); **WORM audit** of every send + escalation.
 
 ---
 

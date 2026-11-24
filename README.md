@@ -43,11 +43,11 @@ knowledge base (gaps become drafted articles).
 | `response_agent` | Knowledge-grounded answer + draft | Retrieve the answer from the KB (cite sources; no source ⇒ confidence ≤ 0.4); draft the tone-aware reply in one pass | LLM (support_kb RAG); fan-in waits for intake and for sentiment to finish; routes to QA (conf ≥ 0.7) or tier-2 (< 0.7) |
 | `qa_agent` | Pre-send safety gate | Check accuracy vs cited sources + tone; exhaustive PII sweep; policy-word probe; block on any PII/policy hit; bounded QA-rework back-edge to response (exhaustion → queue_manager) | LLM; routes approved or flagged drafts to tier-1 |
 | `backlog_triage_agent` | Bulk triage drainer | Drain the queued-ticket backlog: N parallel copies each atomically CLAIM a disjoint batch (never duplicate work), triage each, escalate the worthy ones | LLM (`scaling.copies.count: 3`, atomic `claim_ticket_batch`); scheduled sweep in the business timezone; routes escalations → queue_manager, drain counts → audit |
-| `tier_1_agent_human` | Tier-1 support agent | Review + approve the reply (30-minute window) | Human (Inbox); approve / send / edit_and_send → reply_dispatcher; hold or any other reply → audit; no answer in 30 min → card closes, nothing sent |
+| `tier_1_agent_human` | Tier-1 support agent | Review + approve the reply (30-minute window) | Human (Inbox); verdict approve / send / edit_and_send → reply_dispatcher; hold or any other verdict → audit; no answer in 30 min → default `hold` → audit, nothing sent |
 | `reply_dispatcher_agent` | Egress actuator | SEND the approved reply on the channel it arrived on (in-thread; batched when async/email), log it to the ticket; fail-closed on unapproved / unresolved PII | Programmatic (n8n via vault connection `comms_dispatch_n8n`; Slack/email/CPaaS), dev-store outbox fallback; terminus → audit |
-| `tier_2_specialist_human` | Tier-2 specialist | Billing / security / account depth when the KB had no confident answer (2-hour window) | Human; approve / edit_and_send → reply_dispatcher; hold or any other reply → audit; no answer in 2h → card closes, nothing sent |
-| `sme_human` | Tier-3 SME | Engineering / security / legal matters the coordinator routes (4-hour window) | Human; every reply → audit; no answer in 4h → card closes |
-| `queue_manager_human` | Queue manager | Own escalations, cancel-intent retention, QA rework limit, thread merges, KB article review, the legal/breach gate; receives the Manager's error alerts (1-hour window) | Human; every reply → audit; no answer in 1h → card closes |
+| `tier_2_specialist_human` | Tier-2 specialist | Billing / security / account depth when the KB had no confident answer (2-hour window) | Human; verdict approve / send / edit_and_send → reply_dispatcher; hold or any other verdict → audit; no answer in 2h → default `hold` → audit, nothing sent |
+| `sme_human` | Tier-3 SME | Engineering / security / legal matters the coordinator routes (4-hour window) | Human; every reply → audit (`answer` goes back to the agent that asked); no answer in 4h → default `hold` → audit |
+| `queue_manager_human` | Queue manager | Own escalations, cancel-intent retention, QA rework limit, thread merges, KB article review, the legal/breach decisions; receives the Manager's error alerts (1-hour window) | Human; every reply → audit (`answer` goes back to the agent that asked); no answer in 1h → default `hold` → audit |
 | `support_audit_logger_agent` | WORM audit | Hash-chain every reply sent + every escalation | External (custom sink); terminus |
 | `sla_watchdog_agent` | SLA monitor | Find tickets past SLA in your support desk | Programmatic (n8n connector); cron when wired |
 | `kb_gap_filler_agent` | Knowledge-debt closer | Draft the missing KB article from the resolution path | LLM (kb_style_guide KB); routes draft to queue_manager review |
@@ -77,7 +77,7 @@ direct calls.
 
 - **No-source-no-answer** — response_agent's KB retrieval caps
   confidence at 0.4 if it returns zero cited sources (low confidence
-  routes to tier-2 instead of the QA gate)
+  routes to tier-2 instead of the QA review)
 - **PII sweep** — qa_agent's prompt mandates an exhaustive scan for
   emails + account/customer IDs in the draft body; any hit blocks
   approval (cardinal rule: non-empty pii_concerns ⇒ approved=false)
@@ -96,13 +96,19 @@ direct calls.
   Python: never dispatch a reply that wasn't approved or that still has
   unresolved PII/policy — blocked dispatches record nothing and route to
   audit as a non-send
-- **Silence never sends** — on leafmesh 2.4.486, a review nobody answers in
-  time closes its Inbox card and the ticket records that no reply came.
+- **Replies are typed, then read** — the Inbox has no buttons. The person
+  types a reply and a small reply reader (`gpt-4o-mini`) turns it into a
+  `verdict` (`approve` / `send` / `edit_and_send` / `hold` on the review
+  seats; `hold` on the SME and queue manager). Anything that is not a clear
+  yes reads as `hold`. `answer` (the person answered an agent's question)
+  goes back to only the agent that asked.
+- **Silence never sends** — when a review is not answered in time, the
+  seat's `fallback_response` (`verdict: hold`, `held_for_review`) goes
+  through its routes like any reply and is recorded in the audit log.
   Nothing is sent, and nobody is chased automatically: there is no
-  tier-1 → tier-2 hand-off on silence. Which tier a ticket reaches is decided
-  up front by the routing (confidence, keywords, intent). Each seat still
-  declares `fallback_response: held_for_review` (→ audit) as the intended
-  timeout answer. The Manager raises only errors (hard errors, repeated agent
+  tier-1 → tier-2 hand-off on silence, and no person seat calls another.
+  Which tier a ticket reaches is decided up front by the routing
+  (confidence, keywords, intent). The Manager raises only errors (hard errors, repeated agent
   failures) to the queue manager.
 - **Enterprise state stays enterprise** — CSAT/SLA/identity are read
   from Zendesk/Intercom + Salesforce/Segment via n8n connectors; the
@@ -118,7 +124,7 @@ connectors use dev stand-ins that **announce themselves** until you wire Tiers 2
 ### Tier 1 — required to boot (dev mode)
 | Setting | For | Notes |
 |---|---|---|
-| `LEAFMESH_LICENSE_KEY` | LeafMesh runtime | **Required.** |
+| `LEAFMESH_LICENSE_KEY` | first start | Not kept in `.env`: `create-leafmesh --start` (or `--load`) asks for it once at the first start to sign this environment in (leafmesh 2.4.538+) |
 | `OPENAI_API_KEY` | Coordinator + intake + QA + backlog + Manager (`gpt-4o-mini`) | **Required.** |
 | `ANTHROPIC_API_KEY` | response_agent (Claude) | **Required** unless you change the model. |
 | `REDIS_HOST` / `PORT` / `PASSWORD` | State store | Defaults to `localhost:6379`. Bring your own Redis, or let `create-leafmesh --start .` start one. |

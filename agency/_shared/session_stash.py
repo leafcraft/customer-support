@@ -4,7 +4,7 @@ When a Tier-1 operator approves in the inbox, the SDK resumes the chain with ONL
 the human-response meta fields (`human_message`, `human_decision`, ...) — the
 reply payload that flowed through QA is NOT re-delivered to the next agent. So the
 finisher (reply_dispatcher_agent) stashes the full reply context here, keyed by
-`session_id`, and recovers it after the human gate.
+`session_id`, and recovers it after the human step.
 
 In-process only — survives the human wait because the mesh is one process. A
 multi-replica deployment swaps this for the Redis session store; the get/put
